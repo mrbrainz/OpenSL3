@@ -320,8 +320,9 @@ static int sl3_connect(void) {
     g_hb_busy = 0; g_hb_sent = g_hb_replies = 0;
     g_ioh_hb_inflight = 0;
 
-    if (ioh_start_streams()) printf("  could not start audio streams\n");   /* U.stop is set; main loop reconnects */
     g_hid_ok = ioh_open_hid();
+    if (g_hid_ok) set_rate_44k();   /* before the streams, so the clock estimates start clean */
+    if (ioh_start_streams()) printf("  could not start audio streams\n");   /* U.stop is set; main loop reconnects */
     if (g_hid_ok) {
         set_usb_switches(0x01);
         heartbeat_start();

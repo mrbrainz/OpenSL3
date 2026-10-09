@@ -317,6 +317,13 @@ static void dump_controls(const char *tag, const uint8_t *c) {
 }
 
 /* Set the three per-deck switch bytes to v (01 = USB audio, 00 = thru). */
+/* The box keeps its sample rate across power cycles (another host may have
+ * left it at 48 kHz), so set 44.1 kHz before relying on it. */
+static void set_rate_44k(void) {
+    uint8_t in[HID_REPORT], p[2] = {0xAC, 0x44};
+    if (hid_request(0x31, p, 2, in)) printf("  warning: could not set the sample rate to 44.1 kHz\n");
+}
+
 static int set_usb_switches(uint8_t v) {
     static const int idx[] = {8, 14, 20};
     uint8_t in[HID_REPORT], c[22];
@@ -548,6 +555,7 @@ static int sl3_connect(void) {
     g_hid_ok = (r = libusb_claim_interface(h, IF_HID)) == 0;
     if (!g_hid_ok) printf("  warning: claim interface 3 failed (%s); box will stay in thru\n", libusb_error_name(r));
     else {
+        set_rate_44k();
         set_usb_switches(0x01);
         if (heartbeat_start()) printf("  warning: could not start heartbeat\n");
     }
