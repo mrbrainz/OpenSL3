@@ -1,6 +1,6 @@
 # Build with: brew install libusb pkg-config && make
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra
+CFLAGS  ?= -O2 -Wall -Wextra -mmacosx-version-min=12.0
 USB     := $(shell pkg-config --cflags --libs libusb-1.0)
 BUILD   := build
 

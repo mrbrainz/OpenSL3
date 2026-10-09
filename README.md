@@ -29,7 +29,7 @@ How the SL3's USB protocol works is documented in [docs/PROTOCOL.md](docs/PROTOC
 
 ## Requirements
 
-- An Apple Silicon Mac. Intel Macs should also work, but haven't been tested.
+- An Apple Silicon Mac with macOS 12 Monterey or later (tested on macOS 27). Intel Macs should also work, but haven't been tested.
 - To build: the Xcode command line tools (`xcode-select --install`).
 - [Mixxx] or other DJ software that supports timecode control.
 

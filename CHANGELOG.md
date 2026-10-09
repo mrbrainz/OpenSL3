@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Builds target macOS 12 and later. The 1.0.0 release download was built for macOS 27 only.
+
 ## [1.0.0] - 2026-10-09
 
 The Core Audio driver (`SL3Device.driver`) is now the way to use the SL3; the bridge is kept and documented in `docs/BRIDGE.md`.
