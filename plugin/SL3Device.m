@@ -46,13 +46,28 @@
 #define CAP_PKTS 8      /* microframes per transfer: 1 ms, must be a multiple of 8 */
 #define CAP_NXF 64      /* 64 ms of capture queued */
 #define PLAY_PKTS 8
-#define PLAY_NXF 12     /* 12 ms of playback queued */
+/* Playback queue depth in ms. Completions are sometimes delivered 15-20 ms
+ * late; a shorter queue then runs dry and a few ms of output are lost. */
+#ifndef PLAY_NXF
+#define PLAY_NXF 20
+#endif
 #define RING 16384      /* frames, power of two */
 #define ZTS_PERIOD 2048 /* frames between zero timestamps */
-/* USB completions reach user space up to ~10 ms late, so input must lag and
- * output must lead the hardware by that much plus the transfer length. */
-#define IN_SAFETY  640
-#define OUT_SAFETY 640
+/* Safety offsets (frames): input must lag the hardware by the worst
+ * completion delay, output must lead it by the playback queue plus margin. */
+#ifndef IN_SAFETY
+#define IN_SAFETY  800
+#endif
+#ifndef OUT_SAFETY
+#define OUT_SAFETY (PLAY_NXF * 44 + 80)
+#endif
+/* Converter latency (frames) beyond the USB timeline, from sl3loop. */
+#ifndef LAT_IN
+#define LAT_IN  0
+#endif
+#ifndef LAT_OUT
+#define LAT_OUT 0
+#endif
 
 enum { kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjStreamIn = 3, kObjStreamOut = 4 };
 #define DEVICE_UID CFSTR("SL3Device_UID")
@@ -85,7 +100,7 @@ static int sring_get(sring_t *r, uint64_t s, float *fr) {
 }
 static void sring_clear(sring_t *r) { for (int i = 0; i < RING; i++) atomic_store(&r->stamp[i], 0); }
 
-static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies, resyncs, in_jumps, out_jumps, play_resyncs; double max_err_us, rate; } S;
+static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies, resyncs, in_jumps, out_jumps, play_resyncs; double max_err_us, rate, max_delay_ms; } S;
 
 /* ---- clock model: host ticks = a_host + (sample - a_s) * tpf ---- */
 static struct { _Atomic uint32_t seq; double a_s, a_host, tpf; uint64_t seed; int valid; } g_clk;
@@ -246,6 +261,8 @@ static void cap_submit(int i) {
                 }
             }
             g_cap_done++;
+            double dl = ((double)mach_absolute_time() - (double)done[CAP_PKTS - 1].timeStamp) * g_tick_ns / 1e6;
+            if (done[CAP_PKTS - 1].timeStamp && dl > S.max_delay_ms) S.max_delay_ms = dl;
             if (done[CAP_PKTS - 1].timeStamp) clk_update((double)g_cap_s, (double)done[CAP_PKTS - 1].timeStamp);
         } else if (!usb_fatal(st)) S.xfer_err++;
         if (st != kIOReturnSuccess && !g_stop) os_log_error(g_log, "capture transfer status 0x%x", st);
@@ -401,9 +418,9 @@ static void log_stats(const char *tag) {
     o += snprintf(pk + o, sizeof pk - o, " usb");
     for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_usb[c]); g_pk_usb[c] = 0; }
     os_log(g_log, "%{public}s: %{public}s", tag, pk);
-    os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
+    os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, max delivery %.1f ms, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
            "miss in %ld out %ld, err cap %ld play %ld xfer %ld, hb %ld/%ld",
-           tag, S.rate, S.max_err_us, S.resyncs, S.play_resyncs, S.in_jumps, S.out_jumps,
+           tag, S.rate, S.max_err_us, S.max_delay_ms, S.resyncs, S.play_resyncs, S.in_jumps, S.out_jumps,
            S.in_miss, S.out_miss, S.cap_err, S.play_err, S.xfer_err, S.hb_replies, S.hb_sent);
 }
 
@@ -489,7 +506,7 @@ static int usb_open_all(void) {
     dispatch_source_set_timer(g_stat_timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(g_stat_timer, ^{
         log_stats("stats");
-        S.max_err_us = 0;
+        S.max_err_us = 0; S.max_delay_ms = 0;
         if (g_stop && !g_restarting) { g_restarting = 1; dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ usb_restart(); }); }
     });
     dispatch_resume(g_stat_timer);
@@ -587,7 +604,7 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioDevicePropertyDeviceIsRunning: RET(UInt32, g_io_clients > 0);
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: RET(UInt32, 1);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RET(UInt32, 0);
-        case kAudioDevicePropertyLatency: RET(UInt32, 0);
+        case kAudioDevicePropertyLatency: RET(UInt32, sc == kAudioObjectPropertyScopeInput ? LAT_IN : LAT_OUT);
         case kAudioDevicePropertySafetyOffset: RET(UInt32, sc == kAudioObjectPropertyScopeInput ? IN_SAFETY : OUT_SAFETY);
         case kAudioDevicePropertyNominalSampleRate: RET(Float64, RATE);
         case kAudioDevicePropertyAvailableNominalSampleRates: RET(AudioValueRange, ((AudioValueRange){RATE, RATE}));
