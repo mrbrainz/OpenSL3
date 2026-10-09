@@ -19,11 +19,12 @@
  * Implements get-controls (0x32), a single-byte set-control (0x33), and a
  * heartbeat mode that sends 0x37 with 8 random bytes every 100 ms. Decks whose
  * switch byte (control index 8, 14 or 20) is 01 leave analog thru while the
- * heartbeat runs. Never sends 0x31.
+ * heartbeat runs. Sends 0x31 only for an explicit set-rate (44100 or 48000).
  *
  * Build: make
  * Run:   build/sl3ctl get-controls [--listen SECONDS]
  *        build/sl3ctl set-control INDEX VALUE [--listen SECONDS]
+ *        build/sl3ctl set-rate 44100|48000 [--listen SECONDS]
  *        build/sl3ctl heartbeat SECONDS
  */
 #include <libusb.h>
@@ -79,8 +80,10 @@ int main(int argc, char **argv) {
     double listen = 1.0;
     int hb = argc >= 3 && !strcmp(argv[1], "heartbeat");
     int set = argc >= 4 && !strcmp(argv[1], "set-control");
-    if (argc < 2 || (!set && !hb && strcmp(argv[1], "get-controls"))) {
-        fprintf(stderr, "usage: %s get-controls | set-control INDEX VALUE | heartbeat SECONDS  [--listen SECONDS]\n", argv[0]);
+    int rate = argc >= 3 && !strcmp(argv[1], "set-rate") ? atoi(argv[2]) : 0;
+    if (!strcmp(argc > 1 ? argv[1] : "", "set-rate") && rate != 44100 && rate != 48000) { fprintf(stderr, "rate 44100 or 48000\n"); return 2; }
+    if (argc < 2 || (!set && !hb && !rate && strcmp(argv[1], "get-controls"))) {
+        fprintf(stderr, "usage: %s get-controls | set-control INDEX VALUE | set-rate 44100|48000 | heartbeat SECONDS  [--listen SECONDS]\n", argv[0]);
         return 2;
     }
     int idx = 0, val = 0;
@@ -88,7 +91,7 @@ int main(int argc, char **argv) {
         idx = strtol(argv[2], NULL, 0); val = strtol(argv[3], NULL, 0);
         if (idx < 0 || idx > 21 || val < 0 || val > 255) { fprintf(stderr, "index 0..21, value 0..255\n"); return 2; }
     }
-    for (int i = set ? 4 : 2; i < argc; i++)
+    for (int i = set ? 4 : rate || hb ? 3 : 2; i < argc; i++)
         if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen = atof(argv[++i]);
 
     libusb_context *ctx; libusb_init(&ctx);
@@ -126,6 +129,11 @@ int main(int argc, char **argv) {
         uint8_t p[3] = {(uint8_t)idx, 1, (uint8_t)val};
         printf("== set control %d = 0x%02x\n", idx, val);
         request(h, 0x33, p, 3, listen);
+    }
+    if (rate) {
+        uint8_t p[2] = {(uint8_t)(rate >> 8), (uint8_t)rate};
+        printf("== set rate %d\n", rate);
+        request(h, 0x31, p, 2, listen ? listen : 0.5);
     }
     printf("== get controls\n");
     request(h, 0x32, NULL, 0, listen);

@@ -55,7 +55,7 @@ Replies arrive on interrupt IN `0x81` with the same command byte and sequence nu
 
 The box also sends `0x34` and `0x38` reports without being asked. They are probably the phono/line switch, overload and USB port status notifications; their format is unknown.
 
-Rane's driver only accepts 44,100 and 48,000 Hz, and set 48,000 by default. 48 kHz has not been tested with this project.
+Rane's driver only accepts 44,100 and 48,000 Hz, and set 48,000 by default. Sending `0x31` with `BB 80` switches the box to 48 kHz at once: capture goes from 793,900 to 864,100 bytes/s (44,105 to 48,006 frames/s at 18 bytes per frame), packets stay at 8000/s. `AC 44` switches it back. **The rate survives a power cycle**, like the control bytes, so a host must set it rather than assume 44.1 kHz.
 
 ### Audio controls
 
@@ -94,4 +94,4 @@ Rane's own driver did not restore thru when its client exited, so a host crash l
 
 - What the other bytes in each deck block control (input gain or trim?).
 - The format of the `0x34` and `0x38` notifications, and the meaning of `0x03` and `0x17`.
-- Whether 48 kHz works end to end.
+- Whether 48 kHz audio works end to end (the rate switch itself works).

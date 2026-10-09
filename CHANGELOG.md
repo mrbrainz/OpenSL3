@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- `sl3ctl set-rate 44100|48000` sets the box's sample rate (vendor command `0x31`). The rate survives power cycles.
 - README: Core Audio driver install, removal and Mixxx setup.
 - `SL3Device.driver`: hot-plug. Apps using the SL3 keep the device through an unplug (the decks fall back to thru) and resume when it is plugged in again; when nothing uses it, an unplugged SL3 disappears from Core Audio until it is back.
 - `SL3Device.driver`: fixed coreaudiod spinning at high CPU (and Core Audio apps hanging) after a few device start/stop cycles.

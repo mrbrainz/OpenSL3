@@ -133,7 +133,7 @@ Diagnostic tools used to work out the protocol. None of them is needed to play.
 |------|---------|
 | `sl3probe` | Print the device descriptors and record the SL3's inputs to a WAV file. Never writes to the control channel |
 | `sl3play` | Play a quiet test tone on output channels 1–2 |
-| `sl3ctl` | Read and write the box's control bytes, and send the heartbeat by hand |
+| `sl3ctl` | Read and write the box's control bytes, set the sample rate (`set-rate`), and send the heartbeat by hand |
 | `sl3rec` | Record from a Core Audio device for a few seconds and report levels, channel correlation and callback timing |
 | `sl3tone` | Play a quiet sine on all outputs of a Core Audio device |
 | `sl3loop` | Measure round-trip latency through a loopback cable |
