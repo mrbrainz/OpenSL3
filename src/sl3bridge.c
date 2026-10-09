@@ -21,7 +21,9 @@
  * Run:   build/sl3bridge [--device NAME] [--buffer FRAMES] [--target FRAMES]
  */
 #include <CoreAudio/CoreAudio.h>
+#ifndef SL3_IOUSBHOST
 #include <libusb.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -235,7 +237,9 @@ static void LIBUSB_CALL play_cb(struct libusb_transfer *t) {
 }
 #endif
 
+#ifndef SL3_IOUSBHOST
 static libusb_context *g_ctx;
+#endif
 
 /*
  * Interface 3 control channel. Report: [cmd][seq u32 LE][payload], 64 bytes,
@@ -248,9 +252,11 @@ static libusb_context *g_ctx;
  * Once switched, the box stays in USB mode even after the heartbeat stops, so
  * on exit we set the switch bytes to 00 to hand the decks back to thru.
  */
-static libusb_device_handle *g_h;
 static uint32_t g_hid_seq = 1;
 static long g_hb_sent, g_hb_replies;
+
+#ifndef SL3_IOUSBHOST
+static libusb_device_handle *g_h;
 
 /* Synchronous request; only used when no other thread is running USB events. */
 static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *reply) {
@@ -269,6 +275,10 @@ static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *re
     }
     return -1;
 }
+
+#else
+static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *reply);
+#endif
 
 static void dump_controls(const char *tag, const uint8_t *c) {
     printf("  %s:", tag);
@@ -294,6 +304,7 @@ static int set_usb_switches(uint8_t v) {
     return err;
 }
 
+#ifndef SL3_IOUSBHOST
 /* Asynchronous heartbeat, driven from the USB event thread. */
 static struct libusb_transfer *g_hb_out, *g_hb_in;
 static uint8_t g_hb_out_buf[HID_REPORT], g_hb_in_buf[HID_REPORT];
@@ -342,6 +353,8 @@ static void heartbeat_cancel(void) {
     if (g_hb_out && g_hb_busy) libusb_cancel_transfer(g_hb_out);
 }
 
+#endif
+
 static void make_realtime(void) {
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     double ms = 1e6 * tb.denom / tb.numer; /* mach ticks per ms */
@@ -351,6 +364,7 @@ static void make_realtime(void) {
         printf("  warning: could not make USB thread real-time\n");
 }
 
+#ifndef SL3_IOUSBHOST
 static void *usb_thread(void *arg) {
     (void)arg;
     make_realtime();
@@ -365,6 +379,7 @@ static void *usb_thread(void *arg) {
     }
     return NULL;
 }
+#endif
 
 #ifdef SL3_IOUSBHOST
 #include "iousbhost_streams.m"
@@ -447,6 +462,7 @@ static int get_prop(AudioDeviceID d, AudioObjectPropertySelector sel, AudioObjec
     return AudioObjectGetPropertyData(d, &a, 0, NULL, &sz, v);
 }
 
+#ifndef SL3_IOUSBHOST
 /* ---- SL3 session: open, stream, and tear down (repeatable for reconnects) ---- */
 static libusb_device_handle *g_dev;
 static struct libusb_transfer *g_cx[MAX_NXF], *g_px[MAX_NXF];
@@ -454,26 +470,19 @@ static int g_hid_ok;
 static pthread_t g_usb_th;
 
 static int sl3_connect(void) {
-    int r;
-#ifdef SL3_IOUSBHOST
-    if (ioh_open_streams()) return -1;
-    /* interface 3 still goes through libusb */
-    libusb_device_handle *h = libusb_open_device_with_vid_pid(g_ctx, VID, PID);
-    if (!h) printf("  warning: libusb could not open the SL3; box will stay in thru\n");
-#else
     libusb_device_handle *h = libusb_open_device_with_vid_pid(g_ctx, VID, PID);
     if (!h) return -1;
     printf("[SL3] connected\n");
     int cfg = 0; libusb_get_configuration(h, &cfg);
     if (cfg != 1) libusb_set_configuration(h, 1);
     libusb_claim_interface(h, IF_AC);
+    int r;
     if ((r = libusb_claim_interface(h, IF_CAP)) || (r = libusb_set_interface_alt_setting(h, IF_CAP, 1)) ||
         (r = libusb_claim_interface(h, IF_PLAY)) || (r = libusb_set_interface_alt_setting(h, IF_PLAY, 1))) {
         printf("  interface setup failed: %s\n", libusb_error_name(r));
         libusb_close(h);
         return -1;
     }
-#endif
 
     /* fresh USB-side state; the CoreAudio side keeps running throughout */
     memset(&U, 0, sizeof U);
@@ -482,12 +491,6 @@ static int sl3_connect(void) {
     g_hb_out = g_hb_in = NULL;
     g_hb_busy = 0; g_hb_sent = g_hb_replies = 0;
 
-#ifdef SL3_IOUSBHOST
-    if (ioh_start_streams()) printf("  could not start audio streams\n");   /* U.stop is set; main loop reconnects */
-    g_h = g_dev = h;
-    g_hid_ok = h && (r = libusb_claim_interface(h, IF_HID)) == 0;
-    if (h && !g_hid_ok) printf("  warning: claim interface 3 failed (%s); box will stay in thru\n", libusb_error_name(r));
-#else
     for (int i = 0; i < CAP_NXF; i++) {
         g_cx[i] = libusb_alloc_transfer(CAP_PKTS);
         libusb_fill_iso_transfer(g_cx[i], h, EP_CAP, malloc(CAP_PKTS * PKT_MAX), CAP_PKTS * PKT_MAX, CAP_PKTS, cap_cb, NULL, 1000);
@@ -506,8 +509,7 @@ static int sl3_connect(void) {
     g_h = g_dev = h;
     g_hid_ok = (r = libusb_claim_interface(h, IF_HID)) == 0;
     if (!g_hid_ok) printf("  warning: claim interface 3 failed (%s); box will stay in thru\n", libusb_error_name(r));
-#endif
-    if (g_hid_ok) {
+    else {
         set_usb_switches(0x01);
         if (heartbeat_start()) printf("  warning: could not start heartbeat\n");
     }
@@ -520,12 +522,8 @@ static int sl3_connect(void) {
 static void sl3_disconnect(int present) {
     libusb_device_handle *h = g_dev;
     U.stop = 1;
-#ifdef SL3_IOUSBHOST
-    ioh_stop_streams(present);
-#else
     for (int i = 0; i < CAP_NXF; i++) libusb_cancel_transfer(g_cx[i]);
     for (int i = 0; i < PLAY_NXF; i++) libusb_cancel_transfer(g_px[i]);
-#endif
     heartbeat_cancel();
     pthread_join(g_usb_th, NULL);
     int drained = U.inflight <= 0;
@@ -535,15 +533,6 @@ static void sl3_disconnect(int present) {
     }
     if (g_hid_ok) libusb_release_interface(h, IF_HID);
     printf("  heartbeat: sent %ld, replies %ld\n", g_hb_sent, g_hb_replies);
-#ifdef SL3_IOUSBHOST
-    if (g_hb_out && drained) libusb_free_transfer(g_hb_out);
-    if (g_hb_in && drained) libusb_free_transfer(g_hb_in);
-    g_hb_out = g_hb_in = NULL;
-    if (h) libusb_close(h);
-    g_dev = g_h = NULL;
-    fflush(stdout);
-    return;
-#endif
     if (present) {
         libusb_set_interface_alt_setting(h, IF_PLAY, 0);
         libusb_set_interface_alt_setting(h, IF_CAP, 0);
@@ -563,6 +552,7 @@ static void sl3_disconnect(int present) {
     g_dev = g_h = NULL;
     fflush(stdout);
 }
+#endif
 
 int main(int argc, char **argv) {
     const char *devname = "BlackHole 16ch";
@@ -626,7 +616,9 @@ int main(int argc, char **argv) {
     reader_init(&rd_in, &g_in, target, 0.02);        /* updated once per IO cycle */
     reader_init(&rd_out, &g_out, out_target, 0.0005);    /* updated once per USB transfer (1 ms) */
 
+#ifndef SL3_IOUSBHOST
     libusb_init(&g_ctx);
+#endif
     AudioDeviceIOProcID pid;
     if (AudioDeviceCreateIOProcID(dev, io_proc, NULL, &pid) || AudioDeviceStart(dev, pid)) {
         printf("  could not start CoreAudio IOProc\n"); return 1;
@@ -677,7 +669,9 @@ int main(int argc, char **argv) {
     AudioDeviceStop(dev, pid);
     AudioDeviceDestroyIOProcID(dev, pid);
     if (connected) sl3_disconnect(1);
+#ifndef SL3_IOUSBHOST
     libusb_exit(g_ctx);
+#endif
     (void)g_bad_format;
     return 0;
 }

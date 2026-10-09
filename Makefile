@@ -15,7 +15,7 @@ $(BUILD)/sl3bridge: src/sl3bridge.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(USB) -framework CoreAudio -framework CoreFoundation -lpthread
 
 $(BUILD)/sl3bridge-iousbhost: src/sl3bridge.c src/iousbhost_streams.m | $(BUILD)
-	$(CC) $(CFLAGS) -x objective-c -fobjc-arc -DSL3_IOUSBHOST -o $@ $< $(USB) -framework CoreAudio -framework CoreFoundation -framework Foundation -framework IOKit -framework IOUSBHost -lpthread
+	$(CC) $(CFLAGS) -x objective-c -fobjc-arc -DSL3_IOUSBHOST -o $@ $< -framework CoreAudio -framework CoreFoundation -framework Foundation -framework IOKit -framework IOUSBHost -lpthread
 
 $(BUILD)/%: tools/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(USB) -lm

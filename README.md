@@ -56,7 +56,7 @@ build/sl3bridge
 
 Leave it running while you play. Every second it prints a status line with buffer fill, heartbeat replies and per-channel peak levels. Press Ctrl-C to stop; the decks go back to analog thru.
 
-`build/sl3bridge-iousbhost` is an experimental build of the same bridge that runs the audio streams through Apple's IOUSBHost framework rather than libusb. It takes the same options, except that `--cap-pkts` and `--play-pkts` must be multiples of 8.
+`build/sl3bridge-iousbhost` is an experimental build of the same bridge that talks to the SL3 through Apple's IOUSBHost framework rather than libusb, and needs no libusb. It takes the same options, except that `--cap-pkts` and `--play-pkts` must be multiples of 8.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
