@@ -31,7 +31,15 @@ $(PROBE): plugin/SL3Probe.m plugin/Info.plist | $(BUILD)
 	$(CC) $(CFLAGS) -fobjc-arc -bundle -o $@/Contents/MacOS/SL3Probe $< -framework Foundation -framework CoreFoundation -framework IOKit -framework IOUSBHost
 	codesign -s - -f $@
 
+DEVICE := $(BUILD)/SL3Device.driver
+device-plugin: $(DEVICE)
+$(DEVICE): plugin/SL3Device.m plugin/Device-Info.plist | $(BUILD)
+	mkdir -p $@/Contents/MacOS
+	cp plugin/Device-Info.plist $@/Contents/Info.plist
+	$(CC) $(CFLAGS) -fobjc-arc -bundle -o $@/Contents/MacOS/SL3Device $< -framework Foundation -framework CoreFoundation -framework CoreAudio -framework IOKit -framework IOUSBHost
+	codesign -s - -f $@
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean probe-plugin
+.PHONY: all clean probe-plugin device-plugin

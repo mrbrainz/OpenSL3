@@ -1,0 +1,702 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * SL3 Core Audio device: an AudioServerPlugIn that drives the SL3 directly
+ * through IOUSBHost and publishes it as one 6-in/6-out device at 44.1 kHz.
+ *
+ * The device runs on the SL3's own clock: its sample time is the count of
+ * captured frames, and GetZeroTimeStamp maps sample time to host time with
+ * the controller timestamps of the capture transfers. No resampling here;
+ * Core Audio handles clock drift against other devices like any USB device.
+ *
+ * Rings are indexed by device sample time, with a per-frame stamp holding
+ * the sample time last written to that slot, so stale or missing frames
+ * read as silence.
+ *
+ * USB session (interfaces 1-3, heartbeat, switch bytes) follows
+ * src/iousbhost_streams.m. It starts on the first StartIO and stops on the
+ * last StopIO, handing the decks back to thru.
+ *
+ * Log: log stream --predicate 'subsystem == "sl3.device"'
+ */
+#import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
+#import <IOUSBHost/IOUSBHost.h>
+#include <CoreAudio/AudioServerPlugIn.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <os/log.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#define VID 0x1cc5
+#define PID 0x0001
+#define IF_PLAY 1
+#define IF_CAP  2
+#define IF_HID  3
+#define EP_PLAY 0x06
+#define EP_CAP  0x82
+#define EP_HID_OUT 0x01
+#define EP_HID_IN  0x81
+#define HID_REPORT 64
+#define HEARTBEAT_MS 100
+#define NCH 6
+#define FRAME_BYTES 18
+#define PKT_MAX 126
+#define RATE 44100.0
+#define CAP_PKTS 8      /* microframes per transfer: 1 ms, must be a multiple of 8 */
+#define CAP_NXF 64      /* 64 ms of capture queued */
+#define PLAY_PKTS 8
+#define PLAY_NXF 12     /* 12 ms of playback queued */
+#define RING 16384      /* frames, power of two */
+#define ZTS_PERIOD 2048 /* frames between zero timestamps */
+/* USB completions reach user space up to ~10 ms late, so input must lag and
+ * output must lead the hardware by that much plus the transfer length. */
+#define IN_SAFETY  640
+#define OUT_SAFETY 640
+
+enum { kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjStreamIn = 3, kObjStreamOut = 4 };
+#define DEVICE_UID CFSTR("SL3Device_UID")
+#define MODEL_UID  CFSTR("SL3Device_Model")
+
+static os_log_t g_log;
+static AudioServerPlugInHostRef g_host;
+static ULONG g_refs = 1;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_io_clients;        /* StartIO count */
+static double g_tick_ns;        /* ns per mach tick */
+
+/* ---- sample-time rings ---- */
+typedef struct {
+    float buf[RING * NCH];
+    _Atomic uint64_t stamp[RING];   /* sample time + 1 written to this slot; 0 = never */
+} sring_t;
+static sring_t g_in, g_out;
+
+static void sring_put(sring_t *r, uint64_t s, const float *fr) {
+    unsigned i = s & (RING - 1);
+    memcpy(&r->buf[i * NCH], fr, sizeof(float) * NCH);
+    atomic_store_explicit(&r->stamp[i], s + 1, memory_order_release);
+}
+static int sring_get(sring_t *r, uint64_t s, float *fr) {
+    unsigned i = s & (RING - 1);
+    if (atomic_load_explicit(&r->stamp[i], memory_order_acquire) != s + 1) { memset(fr, 0, sizeof(float) * NCH); return 0; }
+    memcpy(fr, &r->buf[i * NCH], sizeof(float) * NCH);
+    return 1;
+}
+static void sring_clear(sring_t *r) { for (int i = 0; i < RING; i++) atomic_store(&r->stamp[i], 0); }
+
+/* ---- clock model: host ticks = a_host + (sample - a_s) * tpf ---- */
+static struct { _Atomic uint32_t seq; double a_s, a_host, tpf; uint64_t seed; int valid; } g_clk;
+
+static void clk_read(double *a_s, double *a_host, double *tpf, uint64_t *seed, int *valid) {
+    uint32_t q;
+    do {
+        while ((q = atomic_load_explicit(&g_clk.seq, memory_order_acquire)) & 1) ;
+        *a_s = g_clk.a_s; *a_host = g_clk.a_host; *tpf = g_clk.tpf; *seed = g_clk.seed; *valid = g_clk.valid;
+        atomic_thread_fence(memory_order_acquire);
+    } while (atomic_load_explicit(&g_clk.seq, memory_order_relaxed) != q);
+}
+static void clk_write(double a_s, double a_host, double tpf, int new_seed) {
+    atomic_fetch_add_explicit(&g_clk.seq, 1, memory_order_acq_rel);
+    g_clk.a_s = a_s; g_clk.a_host = a_host; g_clk.tpf = tpf; g_clk.valid = 1;
+    if (new_seed) g_clk.seed++;
+    atomic_fetch_add_explicit(&g_clk.seq, 1, memory_order_release);
+}
+static double clk_sample_at(double host) {
+    double a_s, a_h, tpf; uint64_t seed; int v;
+    clk_read(&a_s, &a_h, &tpf, &seed, &v);
+    return a_s + (host - a_h) / tpf;
+}
+
+/* SL3 rate from the oldest and newest of the last RATE_N (timestamp, frames)
+ * pairs, one per 100 ms (as rate_est_t in src/sl3bridge.c). */
+#define RATE_N 100
+static struct { double t[RATE_N], f[RATE_N]; int n, i; } g_rate;
+static double rate_add(double t_ms, double frames) {
+    if (g_rate.n && t_ms - g_rate.t[(g_rate.i + RATE_N - 1) % RATE_N] < 100) return 0;
+    g_rate.t[g_rate.i] = t_ms; g_rate.f[g_rate.i] = frames;
+    g_rate.i = (g_rate.i + 1) % RATE_N;
+    if (g_rate.n < RATE_N) g_rate.n++;
+    if (g_rate.n < 20) return 0;
+    int o = (g_rate.i + RATE_N - g_rate.n) % RATE_N, l = (g_rate.i + RATE_N - 1) % RATE_N;
+    double r = (g_rate.f[l] - g_rate.f[o]) / (g_rate.t[l] - g_rate.t[o]) * 1000;
+    return fabs(r / RATE - 1) < 0.01 ? r : 0;
+}
+
+/* One capture transfer done: frames up to sample s_end were stamped at host tick t_end. */
+static void clk_update(double s_end, double t_end) {
+    double a_s, a_h, tpf; uint64_t seed; int v;
+    clk_read(&a_s, &a_h, &tpf, &seed, &v);
+    double r = rate_add(t_end * g_tick_ns / 1e6, s_end);
+    if (r > 0) tpf = 1e9 / r / g_tick_ns;
+    if (!v) { clk_write(s_end, t_end, 1e9 / RATE / g_tick_ns, 1); return; }
+    double pred = a_h + (s_end - a_s) * tpf, err = t_end - pred;
+    if (fabs(err) > 2e6 / g_tick_ns) { clk_write(s_end, t_end, tpf, 1); return; }   /* >2 ms off: resync */
+    clk_write(s_end, pred + 0.02 * err, tpf, 0);
+}
+
+/* ---- USB session ---- */
+static dispatch_queue_t g_q;
+static IOUSBHostInterface *g_cap, *g_play, *g_hid;
+static IOUSBHostPipe *g_cpipe, *g_ppipe, *g_hout, *g_hin;
+static NSMutableData *g_cbuf[CAP_NXF], *g_pbuf[PLAY_NXF], *g_req_out, *g_req_in, *g_hb_out, *g_hb_in;
+static IOUSBHostIsochronousTransaction g_ctl[CAP_NXF][CAP_PKTS], g_ptl[PLAY_NXF][PLAY_PKTS];
+static uint64_t g_cframe, g_pframe;
+static _Atomic int g_inflight, g_hb_inflight, g_stop;
+static uint64_t g_cap_s, g_play_s;      /* next capture / playback sample time */
+static int g_play_resync;
+#define FIFO_N 4096
+static int g_fifo[FIFO_N];
+static unsigned g_fifo_w, g_fifo_r;
+static double g_acc;
+static uint32_t g_hid_seq = 1, g_hb_seq;
+static int g_hb_busy;
+static dispatch_source_t g_hb_timer;
+static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies; } S;
+
+static void make_realtime(void) {
+    static __thread int done;
+    if (done) return;
+    done = 1;
+    double ms = 1e6 / g_tick_ns;
+    thread_time_constraint_policy_data_t p = { (uint32_t)(1 * ms), (uint32_t)(0.3 * ms), (uint32_t)(1 * ms), 1 };
+    thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                      (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+static io_service_t usb_find(const char *cls, int ifnum) {
+    CFMutableDictionaryRef m = IOServiceMatching(cls);
+    NSMutableDictionary *p = [@{@"idVendor": @VID, @"idProduct": @PID} mutableCopy];
+    if (ifnum >= 0) p[@"bInterfaceNumber"] = @(ifnum);
+    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), (__bridge CFDictionaryRef)p);
+    return IOServiceGetMatchingService(kIOMainPortDefault, m);
+}
+static int usb_present(void) { io_service_t s = usb_find("IOUSBHostDevice", -1); if (s) IOObjectRelease(s); return s != 0; }
+
+static IOUSBHostInterface *usb_open(int ifnum) {
+    io_service_t s = usb_find("IOUSBHostInterface", ifnum);
+    if (!s) return nil;
+    NSError *e = nil;
+    IOUSBHostInterface *i = [[IOUSBHostInterface alloc] initWithIOService:s options:IOUSBHostObjectInitOptionsNone
+                                                                    queue:g_q error:&e interestHandler:nil];
+    IOObjectRelease(s);
+    if (!i) os_log_error(g_log, "open interface %d failed: %{public}@", ifnum, e.localizedDescription);
+    return i;
+}
+
+static int usb_fatal(IOReturn st) {
+    return st == kIOReturnAborted || st == kIOReturnNoDevice || st == kIOReturnNotAttached || st == kIOReturnOffline;
+}
+
+/* Host tick at which USB frame f starts, from the interface's current frame. */
+static double usb_frame_host(IOUSBHostInterface *intf, uint64_t f) {
+    uint64_t t = 0;
+    uint64_t cur = [intf frameNumberWithTime:(IOUSBHostTime *)&t];
+    return (double)t + ((double)f - (double)cur) * 1e6 / g_tick_ns;
+}
+
+static BOOL usb_enqueue(IOUSBHostPipe *pipe, IOUSBHostInterface *intf, NSMutableData *d, IOUSBHostIsochronousTransaction *tl,
+                        int n, uint64_t *frame, IOUSBHostIsochronousTransactionCompletionHandler h) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        NSError *e = nil;
+        if ([pipe enqueueIORequestWithData:d transactionList:tl transactionListCount:n firstFrameNumber:*frame
+                                   options:IOUSBHostIsochronousTransferOptionsNone error:&e completionHandler:h]) {
+            *frame += n / 8;
+            return YES;
+        }
+        S.xfer_err++;
+        *frame = [intf frameNumberWithTime:NULL] + 2;
+        if (pipe == g_ppipe) g_play_resync = 1;
+    }
+    return NO;
+}
+
+static void cap_submit(int i) {
+    IOUSBHostIsochronousTransaction *tl = g_ctl[i];
+    for (int k = 0; k < CAP_PKTS; k++) tl[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = k * PKT_MAX };
+    NSMutableData *d = g_cbuf[i];
+    BOOL ok = usb_enqueue(g_cpipe, g_cap, d, tl, CAP_PKTS, &g_cframe, ^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+        make_realtime();
+        if (st == kIOReturnSuccess) {
+            const uint8_t *p = d.bytes;
+            for (int k = 0; k < CAP_PKTS; k++) {
+                if (done[k].status != kIOReturnSuccess) S.cap_err++;
+                int n = done[k].completeCount / FRAME_BYTES;
+                if (g_fifo_w - g_fifo_r < FIFO_N) g_fifo[g_fifo_w++ % FIFO_N] = n;
+                for (int f = 0; f < n; f++) {
+                    const uint8_t *q = p + done[k].offset + f * FRAME_BYTES;
+                    float fr[NCH];
+                    for (int c = 0; c < NCH; c++) {
+                        int32_t v = q[c * 3] | q[c * 3 + 1] << 8 | q[c * 3 + 2] << 16;
+                        if (v & 0x800000) v -= 1 << 24;
+                        fr[c] = v / 8388608.0f;
+                    }
+                    sring_put(&g_in, g_cap_s++, fr);
+                }
+            }
+            if (done[CAP_PKTS - 1].timeStamp) clk_update((double)g_cap_s, (double)done[CAP_PKTS - 1].timeStamp);
+        } else if (!usb_fatal(st)) S.xfer_err++;
+        if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
+        cap_submit(i);
+    });
+    if (!ok) { g_inflight--; g_stop = 1; }
+}
+
+static void play_submit(int i) {
+    IOUSBHostIsochronousTransaction *tl = g_ptl[i];
+    uint8_t *p = g_pbuf[i].mutableBytes;
+    if (g_play_resync) {   /* schedule slipped: re-derive the sample time of this transfer's first frame */
+        g_play_resync = 0;
+        g_play_s = (uint64_t)llround(clk_sample_at(usb_frame_host(g_play, g_pframe)));
+    }
+    int off = 0;
+    for (int k = 0; k < PLAY_PKTS; k++) {
+        int n;
+        if (g_fifo_r != g_fifo_w) n = g_fifo[g_fifo_r++ % FIFO_N];
+        else { g_acc += RATE * 125e-6; n = (int)g_acc; g_acc -= n; }
+        if (n < 0 || n > PKT_MAX / FRAME_BYTES) n = 5;
+        for (int f = 0; f < n; f++) {
+            float fr[NCH];
+            if (!sring_get(&g_out, g_play_s, fr)) S.out_miss++;
+            g_play_s++;
+            uint8_t *q = p + off + f * FRAME_BYTES;
+            for (int c = 0; c < NCH; c++) {
+                float v = fr[c] > 1 ? 1 : fr[c] < -1 ? -1 : fr[c];
+                int32_t x = (int32_t)lrintf(v * 8388607.0f);
+                q[c * 3] = x; q[c * 3 + 1] = x >> 8; q[c * 3 + 2] = x >> 16;
+            }
+        }
+        tl[k] = (IOUSBHostIsochronousTransaction){ .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)off };
+        off += n * FRAME_BYTES;
+    }
+    BOOL ok = usb_enqueue(g_ppipe, g_play, g_pbuf[i], tl, PLAY_PKTS, &g_pframe, ^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+        make_realtime();
+        if (st == kIOReturnSuccess) { for (int k = 0; k < PLAY_PKTS; k++) if (done[k].status != kIOReturnSuccess) S.play_err++; }
+        else if (!usb_fatal(st)) S.xfer_err++;
+        if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
+        play_submit(i);
+    });
+    if (!ok) { g_inflight--; g_stop = 1; }
+}
+
+/* Interface 3: synchronous request, only while the heartbeat is not running. */
+static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *reply) {
+    uint8_t *out = g_req_out.mutableBytes;
+    uint32_t seq = g_hid_seq++;
+    memset(out, 0, HID_REPORT);
+    out[0] = cmd;
+    memcpy(out + 1, &seq, 4);
+    if (len) memcpy(out + 5, payload, len);
+    NSUInteger n = 0;
+    if (![g_hout sendIORequestWithData:g_req_out bytesTransferred:&n completionTimeout:0 error:nil]) return -1;
+    uint64_t t0 = mach_absolute_time();
+    while ((mach_absolute_time() - t0) * g_tick_ns < 500e6) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block IOReturn st = kIOReturnError;
+        __block NSUInteger got = 0;
+        if (![g_hin enqueueIORequestWithData:g_req_in completionTimeout:0 error:nil
+                           completionHandler:^(IOReturn s2, NSUInteger n2) { st = s2; got = n2; dispatch_semaphore_signal(sem); }])
+            return -1;
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
+            [g_hin abortWithError:nil];
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        }
+        if (st != kIOReturnSuccess || got < 5) continue;
+        memcpy(reply, g_req_in.bytes, HID_REPORT);
+        uint32_t s; memcpy(&s, reply + 1, 4);
+        if (reply[0] == cmd && s == seq) return 0;
+    }
+    return -1;
+}
+
+/* Per-deck switch bytes (indices 8, 14, 20): 01 = USB audio, 00 = thru. */
+static int set_usb_switches(uint8_t v) {
+    static const int idx[] = {8, 14, 20};
+    uint8_t in[HID_REPORT];
+    if (hid_request(0x32, NULL, 0, in)) { os_log_error(g_log, "could not read controls"); return -1; }
+    int err = 0;
+    for (int i = 0; i < 3; i++) {
+        if (in[5 + idx[i]] == v) continue;
+        uint8_t p[3] = {(uint8_t)idx[i], 1, v};
+        uint8_t r[HID_REPORT];
+        if (hid_request(0x33, p, 3, r)) err = -1;
+    }
+    return err;
+}
+
+static void hb_read(void) {
+    g_hb_inflight++;
+    BOOL ok = [g_hin enqueueIORequestWithData:g_hb_in completionTimeout:0 error:nil completionHandler:^(IOReturn st, NSUInteger n) {
+        const uint8_t *b = g_hb_in.bytes;
+        if (st == kIOReturnSuccess && n >= 5) { uint32_t s; memcpy(&s, b + 1, 4); if (b[0] == 0x37 && s == g_hb_seq) S.hb_replies++; }
+        g_hb_inflight--;
+        if (!g_stop && !usb_fatal(st)) hb_read();
+    }];
+    if (!ok) g_hb_inflight--;
+}
+
+static void hb_tick(void) {
+    if (g_stop || g_hb_busy) return;
+    uint8_t *b = g_hb_out.mutableBytes;
+    g_hb_seq = g_hid_seq++;
+    memset(b, 0, HID_REPORT);
+    b[0] = 0x37;
+    memcpy(b + 1, &g_hb_seq, 4);
+    arc4random_buf(b + 5, 8);
+    g_hb_busy = 1;
+    g_hb_inflight++;
+    BOOL ok = [g_hout enqueueIORequestWithData:g_hb_out completionTimeout:0 error:nil completionHandler:^(IOReturn st, NSUInteger n) {
+        (void)n;
+        if (st == kIOReturnSuccess) S.hb_sent++;
+        g_hb_busy = 0;
+        g_hb_inflight--;
+    }];
+    if (!ok) { g_hb_busy = 0; g_hb_inflight--; }
+}
+
+static void usb_close(int present);
+
+static int usb_open_all(void) {
+    if (!g_q) {
+        dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        g_q = dispatch_queue_create("sl3.usb", qa);
+    }
+    io_service_t dsvc = usb_find("IOUSBHostDevice", -1);
+    if (!dsvc) { os_log_error(g_log, "SL3 not found"); return -1; }
+    io_service_t isvc = usb_find("IOUSBHostInterface", IF_CAP);
+    if (isvc) IOObjectRelease(isvc);
+    else {
+        NSError *e = nil;
+        IOUSBHostDevice *dev = [[IOUSBHostDevice alloc] initWithIOService:dsvc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        if (!dev || ![dev configureWithValue:1 matchInterfaces:YES error:&e]) {
+            os_log_error(g_log, "set configuration failed: %{public}@", e.localizedDescription);
+            IOObjectRelease(dsvc);
+            return -1;
+        }
+        [dev destroy];
+        for (int i = 0; i < 30 && !(isvc = usb_find("IOUSBHostInterface", IF_CAP)); i++) usleep(100000);
+        if (isvc) IOObjectRelease(isvc);
+    }
+    IOObjectRelease(dsvc);
+
+    NSError *e = nil;
+    g_cap = usb_open(IF_CAP);
+    g_play = usb_open(IF_PLAY);
+    if (!g_cap || !g_play || ![g_cap selectAlternateSetting:1 error:&e] || ![g_play selectAlternateSetting:1 error:&e] ||
+        !(g_cpipe = [g_cap copyPipeWithAddress:EP_CAP error:&e]) || !(g_ppipe = [g_play copyPipeWithAddress:EP_PLAY error:&e])) {
+        os_log_error(g_log, "stream setup failed: %{public}@", e ? e.localizedDescription : @"interface not found");
+        usb_close(1);
+        return -1;
+    }
+    for (int i = 0; i < CAP_NXF; i++) if (!(g_cbuf[i] = [g_cap ioDataWithCapacity:CAP_PKTS * PKT_MAX error:&e])) { usb_close(1); return -1; }
+    for (int i = 0; i < PLAY_NXF; i++) if (!(g_pbuf[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e])) { usb_close(1); return -1; }
+
+    memset(&S, 0, sizeof S);
+    memset(&g_rate, 0, sizeof g_rate);
+    sring_clear(&g_in); sring_clear(&g_out);
+    g_stop = 0; g_inflight = 0; g_hb_inflight = 0; g_hb_busy = 0;
+    g_fifo_w = g_fifo_r = 0; g_acc = 0; g_cap_s = 0;
+    atomic_fetch_add(&g_clk.seq, 1); g_clk.valid = 0; atomic_fetch_add(&g_clk.seq, 1);
+
+    /* capture first; once the clock model has an anchor, start playback */
+    dispatch_sync(g_q, ^{
+        g_cframe = [g_cap frameNumberWithTime:NULL] + 3;
+        for (int i = 0; i < CAP_NXF && !g_stop; i++) { g_inflight++; cap_submit(i); }
+    });
+    usleep(50000);
+    double a_s, a_h, tpf; uint64_t seed; int valid;
+    clk_read(&a_s, &a_h, &tpf, &seed, &valid);
+    if (!valid || g_stop) { os_log_error(g_log, "capture did not start"); usb_close(1); return -1; }
+    dispatch_sync(g_q, ^{
+        g_fifo_r = g_fifo_w;
+        g_pframe = [g_play frameNumberWithTime:NULL] + 2;
+        g_play_resync = 1;
+        for (int i = 0; i < PLAY_NXF && !g_stop; i++) { g_inflight++; play_submit(i); }
+    });
+
+    /* interface 3: switch the decks to USB audio and keep the heartbeat going */
+    if ((g_hid = usb_open(IF_HID)) && (g_hout = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e]) &&
+        (g_hin = [g_hid copyPipeWithAddress:EP_HID_IN error:&e]) &&
+        (g_req_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_req_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) &&
+        (g_hb_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_hb_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e])) {
+        if (set_usb_switches(0x01)) os_log_error(g_log, "switch write incomplete");
+        dispatch_sync(g_q, ^{ hb_read(); });
+        g_hb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
+        dispatch_source_set_timer(g_hb_timer, dispatch_time(DISPATCH_TIME_NOW, 0), HEARTBEAT_MS * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(g_hb_timer, ^{ hb_tick(); });
+        dispatch_resume(g_hb_timer);
+    } else {
+        os_log_error(g_log, "interface 3 unavailable; decks stay in thru");
+        [g_hid destroy]; g_hid = nil; g_hout = g_hin = nil;
+    }
+    os_log(g_log, "SL3 streaming");
+    return 0;
+}
+
+/* present: the box is still there, so reset alt settings and hand the decks back to thru. */
+static void usb_close(int present) {
+    g_stop = 1;
+    if (g_hb_timer) { dispatch_source_cancel(g_hb_timer); g_hb_timer = nil; }
+    [g_cpipe abortWithError:nil];
+    [g_ppipe abortWithError:nil];
+    [g_hin abortWithError:nil];
+    [g_hout abortWithError:nil];
+    for (int i = 0; i < 200 && (g_inflight > 0 || g_hb_inflight > 0); i++) usleep(10000);
+    if (g_q) dispatch_sync(g_q, ^{});
+    if (g_hid) {
+        if (present && usb_present()) set_usb_switches(0x00);
+        [g_hid destroy];
+    }
+    if (present) { [g_play selectAlternateSetting:0 error:nil]; [g_cap selectAlternateSetting:0 error:nil]; }
+    [g_cap destroy]; [g_play destroy];
+    if (g_q) dispatch_sync(g_q, ^{});
+    os_log(g_log, "SL3 stopped: cap err %ld, play err %ld, xfer err %ld, in miss %ld, out miss %ld, hb %ld/%ld",
+           S.cap_err, S.play_err, S.xfer_err, S.in_miss, S.out_miss, S.hb_replies, S.hb_sent);
+    g_cap = g_play = g_hid = nil;
+    g_cpipe = g_ppipe = g_hout = g_hin = nil;
+    g_req_out = g_req_in = g_hb_out = g_hb_in = nil;
+    for (int i = 0; i < CAP_NXF; i++) g_cbuf[i] = nil;
+    for (int i = 0; i < PLAY_NXF; i++) g_pbuf[i] = nil;
+}
+
+/* ---- AudioServerPlugIn driver interface ---- */
+static HRESULT QI(void *d, REFIID iid, LPVOID *out);
+static ULONG AddRef(void *d) { (void)d; return ++g_refs; }
+static ULONG Release(void *d) { (void)d; return g_refs > 0 ? --g_refs : 0; }
+
+static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host) {
+    (void)d;
+    g_host = host;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    g_tick_ns = (double)tb.numer / tb.denom;
+    os_log(g_log, "Initialize, SL3 %{public}s", usb_present() ? "present" : "not present");
+    return noErr;
+}
+static OSStatus CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *c, AudioObjectID *o) { (void)d; (void)desc; (void)c; (void)o; return kAudioHardwareUnsupportedOperationError; }
+static OSStatus DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID o) { (void)d; (void)o; return kAudioHardwareUnsupportedOperationError; }
+static OSStatus AddClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
+static OSStatus RemoveClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
+static OSStatus PerformCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return noErr; }
+static OSStatus AbortCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return noErr; }
+
+static AudioStreamBasicDescription stream_format(void) {
+    return (AudioStreamBasicDescription){
+        .mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
+        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
+        .mBytesPerPacket = 4 * NCH, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * NCH,
+        .mChannelsPerFrame = NCH, .mBitsPerChannel = 32 };
+}
+
+/* Property table: returns the value size, or 0 if the object has no such property.
+ * With data != NULL, also writes the value (data must hold the returned size). */
+static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const void *qual, void *data) {
+    #define RET(type, val) do { if (data) *(type *)data = (val); return sizeof(type); } while (0)
+    AudioObjectPropertyScope sc = a->mScope;
+    switch (o) {
+    case kObjPlugIn:
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
+        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioPlugInClassID);
+        case kAudioObjectPropertyOwner: RET(AudioObjectID, kAudioObjectUnknown);
+        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("sl3-bridge"));
+        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: RET(AudioObjectID, kObjDevice);
+        case kAudioPlugInPropertyTranslateUIDToDevice: {
+            CFStringRef uid = qual ? *(const CFStringRef *)qual : NULL;
+            RET(AudioObjectID, uid && CFEqual(uid, DEVICE_UID) ? kObjDevice : kAudioObjectUnknown);
+        }
+        case kAudioPlugInPropertyResourceBundle: RET(CFStringRef, CFSTR(""));
+        }
+        return 0;
+    case kObjDevice:
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
+        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioDeviceClassID);
+        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjPlugIn);
+        case kAudioObjectPropertyName: RET(CFStringRef, CFSTR("Rane SL3"));
+        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("Rane"));
+        case kAudioDevicePropertyDeviceUID: RET(CFStringRef, DEVICE_UID);
+        case kAudioDevicePropertyModelUID: RET(CFStringRef, MODEL_UID);
+        case kAudioDevicePropertyTransportType: RET(UInt32, kAudioDeviceTransportTypeUSB);
+        case kAudioDevicePropertyRelatedDevices: RET(AudioObjectID, kObjDevice);
+        case kAudioDevicePropertyClockDomain: RET(UInt32, 0);
+        case kAudioDevicePropertyDeviceIsAlive: RET(UInt32, 1);
+        case kAudioDevicePropertyDeviceIsRunning: RET(UInt32, g_io_clients > 0);
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice: RET(UInt32, 1);
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RET(UInt32, 0);
+        case kAudioDevicePropertyLatency: RET(UInt32, 0);
+        case kAudioDevicePropertySafetyOffset: RET(UInt32, sc == kAudioObjectPropertyScopeInput ? IN_SAFETY : OUT_SAFETY);
+        case kAudioDevicePropertyNominalSampleRate: RET(Float64, RATE);
+        case kAudioDevicePropertyAvailableNominalSampleRates: RET(AudioValueRange, ((AudioValueRange){RATE, RATE}));
+        case kAudioDevicePropertyIsHidden: RET(UInt32, 0);
+        case kAudioDevicePropertyZeroTimeStampPeriod: RET(UInt32, ZTS_PERIOD);
+        case kAudioDevicePropertyPreferredChannelsForStereo: {
+            if (data) { ((UInt32 *)data)[0] = 1; ((UInt32 *)data)[1] = 2; }
+            return 2 * sizeof(UInt32);
+        }
+        case kAudioObjectPropertyOwnedObjects: case kAudioDevicePropertyStreams: {
+            int nin = sc != kAudioObjectPropertyScopeOutput, nout = sc != kAudioObjectPropertyScopeInput;
+            if (data) { AudioObjectID *p = data; if (nin) *p++ = kObjStreamIn; if (nout) *p = kObjStreamOut; }
+            return (UInt32)((nin + nout) * sizeof(AudioObjectID));
+        }
+        }
+        return 0;
+    case kObjStreamIn: case kObjStreamOut:
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
+        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioStreamClassID);
+        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjDevice);
+        case kAudioStreamPropertyIsActive: RET(UInt32, 1);
+        case kAudioStreamPropertyDirection: RET(UInt32, o == kObjStreamIn);
+        case kAudioStreamPropertyTerminalType: RET(UInt32, kAudioStreamTerminalTypeLine);
+        case kAudioStreamPropertyStartingChannel: RET(UInt32, 1);
+        case kAudioStreamPropertyLatency: RET(UInt32, 0);
+        case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: RET(AudioStreamBasicDescription, stream_format());
+        case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats:
+            RET(AudioStreamRangedDescription, ((AudioStreamRangedDescription){stream_format(), {RATE, RATE}}));
+        }
+        return 0;
+    }
+    return 0;
+    #undef RET
+}
+
+/* Properties that exist with an empty value. */
+static int prop_empty(AudioObjectID o, const AudioObjectPropertyAddress *a) {
+    return (o == kObjDevice && a->mSelector == kAudioObjectPropertyControlList) ||
+           (o == kObjPlugIn && a->mSelector == kAudioPlugInPropertyBoxList) ||
+           ((o == kObjStreamIn || o == kObjStreamOut) && a->mSelector == kAudioObjectPropertyOwnedObjects);
+}
+
+static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a) {
+    (void)d; (void)pid;
+    if (a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) return o == kObjPlugIn;
+    return prop_empty(o, a) || prop(o, a, NULL, NULL) > 0;
+}
+static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, Boolean *s) {
+    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    *s = false;
+    return noErr;
+}
+static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
+    (void)qs;
+    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    *sz = prop_empty(o, a) ? 0 : prop(o, a, q, NULL);
+    return noErr;
+}
+static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 in, UInt32 *out, void *data) {
+    (void)qs;
+    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    if (prop_empty(o, a)) { *out = 0; return noErr; }
+    UInt32 need = prop(o, a, q, NULL);
+    /* list properties may be asked for fewer items than they have */
+    int list = a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioDevicePropertyStreams ||
+               a->mSelector == kAudioPlugInPropertyDeviceList;
+    if (in < need) {
+        if (!list) return kAudioHardwareBadPropertySizeError;
+        uint8_t tmp[64];
+        prop(o, a, q, tmp);
+        *out = in / sizeof(AudioObjectID) * sizeof(AudioObjectID);
+        memcpy(data, tmp, *out);
+        return noErr;
+    }
+    *out = prop(o, a, q, data);
+    return noErr;
+}
+static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz, const void *data) {
+    (void)qs; (void)q; (void)sz; (void)data;
+    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    if (o == kObjDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate && sz >= sizeof(Float64) && *(const Float64 *)data == RATE) return noErr;
+    return kAudioHardwareUnsupportedOperationError;
+}
+
+static void notify_running(void) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    g_host->PropertiesChanged(g_host, kObjDevice, 1, &a);
+}
+
+static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) {
+    (void)d; (void)c;
+    if (o != kObjDevice) return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&g_lock);
+    OSStatus r = noErr;
+    if (g_io_clients == 0) {
+        if (usb_open_all()) r = kAudioHardwareNotRunningError;
+        else { g_io_clients = 1; pthread_mutex_unlock(&g_lock); notify_running(); return noErr; }
+    } else g_io_clients++;
+    pthread_mutex_unlock(&g_lock);
+    return r;
+}
+static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) {
+    (void)d; (void)c;
+    if (o != kObjDevice) return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&g_lock);
+    int last = g_io_clients == 1;
+    if (g_io_clients > 0) g_io_clients--;
+    if (last) usb_close(1);
+    pthread_mutex_unlock(&g_lock);
+    if (last) notify_running();
+    return noErr;
+}
+
+static OSStatus ZeroTS(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, Float64 *st, UInt64 *ht, UInt64 *seed) {
+    (void)d; (void)c;
+    if (o != kObjDevice) return kAudioHardwareBadObjectError;
+    double a_s, a_h, tpf; uint64_t sd; int v;
+    clk_read(&a_s, &a_h, &tpf, &sd, &v);
+    if (!v) { *st = 0; *ht = mach_absolute_time(); *seed = 1; return noErr; }
+    double now_s = a_s + ((double)mach_absolute_time() - a_h) / tpf;
+    double k = floor(now_s / ZTS_PERIOD) * ZTS_PERIOD;
+    *st = k;
+    *ht = (UInt64)llround(a_h + (k - a_s) * tpf);
+    *seed = sd;
+    return noErr;
+}
+
+static OSStatus WillDo(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, Boolean *w, Boolean *ip) {
+    (void)d; (void)o; (void)c;
+    *w = op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix;
+    *ip = true;
+    return noErr;
+}
+static OSStatus BeginOp(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, UInt32 n, const AudioServerPlugInIOCycleInfo *i) { (void)d; (void)o; (void)c; (void)op; (void)n; (void)i; return noErr; }
+static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectID s, UInt32 c, UInt32 op, UInt32 n,
+                     const AudioServerPlugInIOCycleInfo *ci, void *main, void *sec) {
+    (void)d; (void)o; (void)s; (void)c; (void)sec;
+    float *buf = main;
+    if (op == kAudioServerPlugInIOOperationReadInput) {
+        uint64_t t = (uint64_t)llround(ci->mInputTime.mSampleTime);
+        long miss = 0;
+        for (UInt32 f = 0; f < n; f++) miss += !sring_get(&g_in, t + f, buf + f * NCH);
+        if (miss) S.in_miss += miss;
+    } else if (op == kAudioServerPlugInIOOperationWriteMix) {
+        uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
+        for (UInt32 f = 0; f < n; f++) sring_put(&g_out, t + f, buf + f * NCH);
+    }
+    return noErr;
+}
+static OSStatus EndOp(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, UInt32 n, const AudioServerPlugInIOCycleInfo *i) { (void)d; (void)o; (void)c; (void)op; (void)n; (void)i; return noErr; }
+
+static AudioServerPlugInDriverInterface g_iface = {
+    NULL, QI, AddRef, Release, Initialize, CreateDevice, DestroyDevice, AddClient, RemoveClient,
+    PerformCfg, AbortCfg, HasProperty, IsSettable, GetSize, GetData, SetData,
+    StartIO, StopIO, ZeroTS, WillDo, BeginOp, DoOp, EndOp
+};
+static AudioServerPlugInDriverInterface *g_ifacep = &g_iface;
+
+static HRESULT QI(void *d, REFIID iid, LPVOID *out) {
+    CFUUIDRef req = CFUUIDCreateFromUUIDBytes(NULL, iid);
+    Boolean ok = CFEqual(req, IUnknownUUID) || CFEqual(req, kAudioServerPlugInDriverInterfaceUUID);
+    CFRelease(req);
+    if (!ok) { *out = NULL; return E_NOINTERFACE; }
+    AddRef(d);
+    *out = &g_ifacep;
+    return S_OK;
+}
+
+__attribute__((visibility("default")))
+void *SL3Device_Create(CFAllocatorRef alloc, CFUUIDRef type) {
+    (void)alloc;
+    g_log = os_log_create("sl3.device", "driver");
+    if (!CFEqual(type, kAudioServerPlugInTypeUUID)) return NULL;
+    return &g_ifacep;
+}
