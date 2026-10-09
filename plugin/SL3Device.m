@@ -343,18 +343,28 @@ static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *re
     return -1;
 }
 
+/* The 22 control bytes as hex, grouped per 6-byte deck block (indices 3-8, 9-14, 15-20). */
+static void log_controls(const char *tag, const uint8_t *c) {
+    char b[100]; int o = 0;
+    for (int i = 0; i < 22; i++) o += snprintf(b + o, sizeof b - o, "%s%02x", i == 3 || i == 9 || i == 15 || i == 21 ? " | " : i ? " " : "", c[i]);
+    os_log(g_log, "%{public}s: %{public}s", tag, b);
+}
+
 /* Per-deck switch bytes (indices 8, 14, 20): 01 = USB audio, 00 = thru. */
 static int set_usb_switches(uint8_t v) {
     static const int idx[] = {8, 14, 20};
     uint8_t in[HID_REPORT];
     if (hid_request(0x32, NULL, 0, in)) { os_log_error(g_log, "could not read controls"); return -1; }
-    int err = 0;
+    log_controls(v ? "controls before USB" : "controls before thru", in + 5);
+    int err = 0, changed = 0;
     for (int i = 0; i < 3; i++) {
         if (in[5 + idx[i]] == v) continue;
         uint8_t p[3] = {(uint8_t)idx[i], 1, v};
         uint8_t r[HID_REPORT];
         if (hid_request(0x33, p, 3, r)) err = -1;
+        changed = 1;
     }
+    if (changed && hid_request(0x32, NULL, 0, in) == 0) log_controls("controls after", in + 5);
     return err;
 }
 
