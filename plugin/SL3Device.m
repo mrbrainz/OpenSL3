@@ -685,7 +685,7 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: RET(AudioClassID, kAudioPlugInClassID);
         case kAudioObjectPropertyOwner: RET(AudioObjectID, kAudioObjectUnknown);
-        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("sl3-bridge"));
+        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("OpenSL3"));
         case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList:
             if (!g_visible) return 0;
             RET(AudioObjectID, kObjDevice);

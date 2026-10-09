@@ -83,7 +83,7 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
     case kAudioObjectPropertyBaseClass: if (in < 4) return kAudioHardwareBadPropertySizeError; *(AudioClassID *)data = kAudioObjectClassID; *out = 4; break;
     case kAudioObjectPropertyClass: if (in < 4) return kAudioHardwareBadPropertySizeError; *(AudioClassID *)data = kAudioPlugInClassID; *out = 4; break;
     case kAudioObjectPropertyOwner: if (in < 4) return kAudioHardwareBadPropertySizeError; *(AudioObjectID *)data = kAudioObjectUnknown; *out = 4; break;
-    case kAudioObjectPropertyManufacturer: if (in < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError; *(CFStringRef *)data = CFSTR("sl3-bridge"); *out = sizeof(CFStringRef); break;
+    case kAudioObjectPropertyManufacturer: if (in < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError; *(CFStringRef *)data = CFSTR("OpenSL3"); *out = sizeof(CFStringRef); break;
     default: *out = 0;
     }
     return noErr;

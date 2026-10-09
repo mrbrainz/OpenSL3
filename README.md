@@ -1,4 +1,4 @@
-# SL3 Bridge
+# OpenSL3
 
 A Core Audio driver for the **Rane SL3** DVS interface on Apple Silicon Macs, with no kernel extension and no Serato software.
 

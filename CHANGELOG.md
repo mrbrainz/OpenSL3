@@ -1,7 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.1] - 2026-10-09
 
+- Project renamed to OpenSL3 (previously sl3-bridge).
 - Builds target macOS 12 and later. The 1.0.0 release download was built for macOS 27 only.
 
 ## [1.0.0] - 2026-10-09
