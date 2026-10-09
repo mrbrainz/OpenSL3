@@ -16,7 +16,7 @@
 #include <mach/mach_time.h>
 
 #define MAXCH 16
-#define MAXF (44100 * 30)
+#define MAXF (48000 * 30)
 static float *g_buf;
 static UInt32 g_ch, g_n, g_max;
 /* callback timing */
@@ -126,8 +126,24 @@ int main(int argc, char **argv) {
         for (UInt32 f = s0; f < g_n; f++) { double v = g_buf[f * g_ch + c] - m; q += v * v; }
         mean[c] = m; rms[c] = sqrt(q / n);
     }
-    printf("ch   rms dBFS\n");
-    for (UInt32 c = 0; c < g_ch; c++) printf("%2u  %8.1f\n", (unsigned)c + 1, rms[c] > 1e-9 ? 20 * log10(rms[c]) : -180.0);
+    /* dominant frequency from rising zero crossings (with a little hysteresis),
+     * interpolated between samples: checks the input sample rate against a
+     * known tone such as a 1 kHz timecode carrier */
+    printf("ch   rms dBFS   freq Hz\n");
+    for (UInt32 c = 0; c < g_ch; c++) {
+        double first = -1, last = -1, h = rms[c] * 0.2; long cross = 0; int armed = 0;
+        for (UInt32 f = s0 + 1; f < g_n; f++) {
+            double y0 = g_buf[(f - 1) * g_ch + c] - mean[c], y1 = g_buf[f * g_ch + c] - mean[c];
+            if (y1 < -h) armed = 1;
+            if (armed && y0 < 0 && y1 >= 0) {
+                double t = f - 1 + y0 / (y0 - y1);
+                if (first < 0) first = t; else cross++;
+                last = t; armed = 0;
+            }
+        }
+        double hz = cross > 0 && rms[c] > 1e-4 ? cross / ((last - first) / fmt.mSampleRate) : 0;
+        printf("%2u  %8.1f  %8.2f\n", (unsigned)c + 1, rms[c] > 1e-9 ? 20 * log10(rms[c]) : -180.0, hz);
+    }
     printf("correlation\n    ");
     for (UInt32 c = 0; c < g_ch; c++) printf("%7u", (unsigned)c + 1);
     printf("\n");

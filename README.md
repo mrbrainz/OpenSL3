@@ -94,7 +94,7 @@ Diagnostic tools, built with `make` (needs [Homebrew] with `brew install libusb 
 | Tool | Purpose |
 |------|---------|
 | `sl3plugtest` | Load `SL3Device.driver` outside Core Audio, check its properties and cycle IO; `hotplug SECONDS` and `rate HZ SECONDS` modes. Built by `make device-plugin` |
-| `sl3rec` | Record from a Core Audio device for a few seconds and report levels, channel correlation and callback timing |
+| `sl3rec` | Record from a Core Audio device for a few seconds and report levels, dominant frequency, channel correlation and callback timing |
 | `sl3tone` | Play a quiet sine on all outputs of a Core Audio device |
 | `sl3loop` | Measure round-trip latency through a loopback cable |
 | `sl3ctl` | Read and write the box's control bytes, set the sample rate (`set-rate`), and send the heartbeat by hand |
