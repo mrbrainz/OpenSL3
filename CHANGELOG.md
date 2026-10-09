@@ -5,6 +5,7 @@
 - Lower default latency: about 24 ms in and 29 ms out, down from 33 and 45.
 - New options to tune the ring buffers and USB transfer sizes (`--out-target`, `--cap-pkts`, `--cap-xfers`, `--play-pkts`, `--play-xfers`).
 - Status output shows the estimated latency and USB packet rates.
+- New `sl3usbtiming` tool compares isochronous capture timing between IOUSBHost and libusb.
 
 ## [0.1.0] - 2026-10-09
 
