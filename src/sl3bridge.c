@@ -106,13 +106,14 @@ typedef struct {
     ring_t *q;
     double target, alpha, avg, ratio, frac;
     float cur[NCH], next[NCH];
+    double ff;     /* feed-forward ratio from the measured clocks; 1 if unknown */
     int primed;
     uint64_t underruns, resets;
 } reader_t;
 
 static void reader_init(reader_t *rd, ring_t *q, double target, double alpha) {
     memset(rd, 0, sizeof *rd);
-    rd->q = q; rd->target = target; rd->alpha = alpha; rd->avg = target; rd->ratio = 1;
+    rd->q = q; rd->target = target; rd->alpha = alpha; rd->avg = target; rd->ratio = 1; rd->ff = 1;
 }
 
 /* Call once per block before reading, so the fill is sampled at a steady phase. */
@@ -136,7 +137,35 @@ static void reader_update(reader_t *rd) {
     double dev = 0.001 * (rd->avg - rd->target) / rd->target * 4;
     if (dev > MAX_RATIO_DEV) dev = MAX_RATIO_DEV;
     if (dev < -MAX_RATIO_DEV) dev = -MAX_RATIO_DEV;
-    rd->ratio = 1 + dev;
+    rd->ratio = rd->ff + dev;
+}
+
+/*
+ * Clock rate estimate: frames counted against host time, taken from the
+ * oldest and newest of the last RATE_N samples (one per 100 ms, ~10 s window).
+ * Fed with hardware timestamps, so callback jitter does not enter it.
+ */
+#define RATE_N 100
+typedef struct { double t[RATE_N], f[RATE_N]; int n, i; } rate_est_t;
+static _Atomic double g_rate_sl3, g_rate_bh;   /* Hz in host time; 0 until known */
+
+static __attribute__((unused)) void rate_reset(rate_est_t *e, _Atomic double *out) { e->n = e->i = 0; atomic_store(out, 0); }
+
+static void rate_add(rate_est_t *e, double t_ms, double frames, _Atomic double *out) {
+    if (e->n && t_ms - e->t[(e->i + RATE_N - 1) % RATE_N] < 100) return;
+    e->t[e->i] = t_ms; e->f[e->i] = frames;
+    e->i = (e->i + 1) % RATE_N;
+    if (e->n < RATE_N) e->n++;
+    if (e->n < 20) return;
+    int o = (e->i + RATE_N - e->n) % RATE_N, l = (e->i + RATE_N - 1) % RATE_N;
+    double r = (e->f[l] - e->f[o]) / (e->t[l] - e->t[o]) * 1000;
+    if (fabs(r / RATE - 1) < 0.01) atomic_store(out, r);
+}
+
+/* Frames of clock a consumed per frame of clock b; 1 until both are known. */
+static double clock_ratio(_Atomic double *a, _Atomic double *b) {
+    double ra = atomic_load(a), rb = atomic_load(b);
+    return ra > 0 && rb > 0 ? ra / rb : 1;
 }
 
 static void reader_read(reader_t *rd, float *out) {
@@ -184,6 +213,7 @@ static void cap_packet(const uint8_t *p, int len, int ok) {
 /* Fill npkts playback microframes into buf back to back; returns total bytes. */
 static int fill_play_buf(uint8_t *p, int npkts, int *lens) {
     int total = 0;
+    rd_out.ff = clock_ratio(&g_rate_bh, &g_rate_sl3);
     reader_update(&rd_out);
     for (int i = 0; i < npkts; i++) {
         int n;
@@ -442,7 +472,15 @@ static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now, const Audi
         peak(g_pk_out, fr);
     }
 
+    /* BlackHole's clock against host time */
+    static rate_est_t bh_rate;
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    if ((now->mFlags & kAudioTimeStampSampleHostTimeValid) == kAudioTimeStampSampleHostTimeValid)
+        rate_add(&bh_rate, now->mHostTime * (double)tb.numer / tb.denom / 1e6, now->mSampleTime, &g_rate_bh);
+
     /* SL3 inputs -> BlackHole 1..6 */
+    rd_in.ff = clock_ratio(&g_rate_sl3, &g_rate_bh);
     reader_update(&rd_in);
     g_io_frames += frames;
     for (UInt32 f = 0; f < frames; f++) {
@@ -649,8 +687,11 @@ int main(int argc, char **argv) {
         if (warm > 3) {
             /* both packet rates should be 8000/s; less means microframes were missed */
             double el = (ms_now() - t_start) / 1000;
-            printf("  rates: usb %.1f Hz, coreaudio %.1f Hz, packets/s cap %.1f play %.1f\n",
+            printf("  rates: usb %.1f Hz, coreaudio %.1f Hz, packets/s cap %.1f play %.1f",
                    (g_usb_frames - uf0) / el, (g_io_frames - if0) / el, (U.cap_pkts - cp0) / el, (U.play_pkts - pp0) / el);
+            if (atomic_load(&g_rate_sl3) > 0 && atomic_load(&g_rate_bh) > 0)
+                printf(" | clocks: sl3 %.3f Hz, blackhole %.3f Hz", atomic_load(&g_rate_sl3), atomic_load(&g_rate_bh));
+            printf("\n");
         }
         printf("  in: fill %5llu ratio %.6f under %llu over %llu reset %llu | out: fill %5llu ratio %.6f under %llu over %llu reset %llu | usb err %ld/%ld/%ld hb %ld/%ld | max gap usb %.1f ms io %.1f ms\n",
                (unsigned long long)ring_fill(&g_in), rd_in.ratio, (unsigned long long)rd_in.underruns, (unsigned long long)g_in.overruns, (unsigned long long)rd_in.resets,

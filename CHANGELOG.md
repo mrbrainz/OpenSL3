@@ -6,7 +6,7 @@
 - New options to tune the ring buffers and USB transfer sizes (`--out-target`, `--cap-pkts`, `--cap-xfers`, `--play-pkts`, `--play-xfers`).
 - Status output shows the estimated latency and USB packet rates.
 - New `sl3usbtiming` tool compares isochronous capture timing between IOUSBHost and libusb.
-- Experimental `sl3bridge-iousbhost` build: same bridge on Apple's IOUSBHost framework instead of libusb (audio streams and control channel), with no libusb dependency.
+- Experimental `sl3bridge-iousbhost` build: same bridge on Apple's IOUSBHost framework instead of libusb (audio streams and control channel), with no libusb dependency. It measures the SL3 and loopback clocks from hardware timestamps and sets the resampling ratios from them, which keeps the output ratio steadier.
 
 ## [0.1.0] - 2026-10-09
 

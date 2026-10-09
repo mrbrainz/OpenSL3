@@ -18,6 +18,8 @@ static NSMutableData *g_ioh_cbuf[MAX_NXF], *g_ioh_pbuf[MAX_NXF];
 static IOUSBHostIsochronousTransaction g_ioh_ctl[MAX_NXF][64], g_ioh_ptl[MAX_NXF][64];
 static uint64_t g_ioh_cframe, g_ioh_pframe;
 static _Atomic int g_ioh_inflight;
+static rate_est_t g_ioh_sl3_rate;   /* only touched on g_ioh_q */
+static double g_ioh_sl3_frames, g_ioh_tick_ms;
 
 static io_service_t ioh_find(const char *cls, int ifnum) {
     CFMutableDictionaryRef m = IOServiceMatching(cls);
@@ -64,6 +66,7 @@ static BOOL ioh_enqueue(IOUSBHostPipe *pipe, IOUSBHostInterface *intf, NSMutable
         }
         U.xfer_err++;
         *frame = [intf frameNumberWithTime:NULL] + 2;
+        if (pipe == g_ioh_cpipe) rate_reset(&g_ioh_sl3_rate, &g_rate_sl3);   /* capture frames were skipped */
     }
     return NO;
 }
@@ -78,8 +81,13 @@ static void ioh_cap_submit(int i) {
         static double last; note_gap(&last, &g_gap_usb);
         if (st == kIOReturnSuccess) {
             const uint8_t *p = d.bytes;
-            for (int k = 0; k < CAP_PKTS; k++)
+            for (int k = 0; k < CAP_PKTS; k++) {
                 cap_packet(p + done[k].offset, done[k].completeCount, done[k].status == kIOReturnSuccess);
+                g_ioh_sl3_frames += done[k].completeCount / FRAME_BYTES;
+            }
+            /* controller timestamp of the last microframe: the SL3's clock against host time */
+            if (done[CAP_PKTS - 1].timeStamp)
+                rate_add(&g_ioh_sl3_rate, done[CAP_PKTS - 1].timeStamp * g_ioh_tick_ms, g_ioh_sl3_frames, &g_rate_sl3);
         } else if (!ioh_fatal(st)) U.xfer_err++;
         if (U.stop || ioh_fatal(st)) { U.stop = 1; g_ioh_inflight--; return; }
         ioh_cap_submit(i);
@@ -157,7 +165,10 @@ static int ioh_start_streams(void) {
     for (int i = 0; i < PLAY_NXF; i++)
         if (!(g_ioh_pbuf[i] = [g_ioh_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e])) goto fail;
     g_ioh_inflight = 0;
+    if (!g_ioh_tick_ms) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); g_ioh_tick_ms = (double)tb.numer / tb.denom / 1e6; }
     dispatch_sync(g_ioh_q, ^{
+        g_ioh_sl3_frames = 0;
+        rate_reset(&g_ioh_sl3_rate, &g_rate_sl3);
         g_ioh_cframe = [g_ioh_cap frameNumberWithTime:NULL] + 3;
         for (int i = 0; i < CAP_NXF && !U.stop; i++) { g_ioh_inflight++; ioh_cap_submit(i); }
     });
