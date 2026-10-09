@@ -659,6 +659,26 @@ static int prop_empty(AudioObjectID o, const AudioObjectPropertyAddress *a) {
            ((o == kObjStreamIn || o == kObjStreamOut) && a->mSelector == kAudioObjectPropertyOwnedObjects);
 }
 
+/* kAudioObjectPropertyOwnedObjects, filtered by the qualifier's class IDs:
+ * an object matches if its class or base class is listed. Returns the count. */
+static UInt32 owned(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, AudioObjectID *ids) {
+    AudioObjectID all[4];
+    UInt32 n = prop(o, a, NULL, all) / sizeof(AudioObjectID), k = 0;
+    for (UInt32 i = 0; i < n; i++) {
+        AudioClassID cls = all[i] == kObjDevice ? kAudioDeviceClassID : kAudioStreamClassID;
+        int ok = !q || qs < sizeof(AudioClassID);
+        for (UInt32 j = 0; !ok && j < qs / sizeof(AudioClassID); j++) {
+            AudioClassID c = ((const AudioClassID *)q)[j];
+            ok = c == cls || c == kAudioObjectClassID;
+        }
+        if (ok) ids[k++] = all[i];
+    }
+    return k;
+}
+static int is_owned(AudioObjectID o, const AudioObjectPropertyAddress *a) {
+    return a->mSelector == kAudioObjectPropertyOwnedObjects && (o == kObjPlugIn || o == kObjDevice);
+}
+
 static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a) {
     (void)d; (void)pid;
     if (a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) return o == kObjPlugIn;
@@ -670,15 +690,22 @@ static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t 
     return noErr;
 }
 static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
-    (void)qs;
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    *sz = prop_empty(o, a) ? 0 : prop(o, a, q, NULL);
+    AudioObjectID ids[4];
+    *sz = prop_empty(o, a) ? 0 : is_owned(o, a) ? owned(o, a, qs, q, ids) * (UInt32)sizeof(AudioObjectID) : prop(o, a, q, NULL);
     return noErr;
 }
 static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 in, UInt32 *out, void *data) {
-    (void)qs;
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
     if (prop_empty(o, a)) { *out = 0; return noErr; }
+    if (is_owned(o, a)) {
+        AudioObjectID ids[4];
+        UInt32 n = owned(o, a, qs, q, ids);
+        if (n > in / sizeof(AudioObjectID)) n = in / sizeof(AudioObjectID);
+        memcpy(data, ids, n * sizeof(AudioObjectID));
+        *out = n * (UInt32)sizeof(AudioObjectID);
+        return noErr;
+    }
     UInt32 need = prop(o, a, q, NULL);
     /* list properties may be asked for fewer items than they have */
     int list = a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioDevicePropertyStreams ||
