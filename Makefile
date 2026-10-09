@@ -23,7 +23,15 @@ $(BUILD)/%: tools/%.c | $(BUILD)
 $(BUILD)/sl3usbtiming: tools/sl3usbtiming.m | $(BUILD)
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< $(USB) -framework Foundation -framework IOKit -framework IOUSBHost
 
+PROBE := $(BUILD)/SL3Probe.driver
+probe-plugin: $(PROBE)
+$(PROBE): plugin/SL3Probe.m plugin/Info.plist | $(BUILD)
+	mkdir -p $@/Contents/MacOS
+	cp plugin/Info.plist $@/Contents/
+	$(CC) $(CFLAGS) -fobjc-arc -bundle -o $@/Contents/MacOS/SL3Probe $< -framework Foundation -framework CoreFoundation -framework IOKit -framework IOUSBHost
+	codesign -s - -f $@
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all clean probe-plugin

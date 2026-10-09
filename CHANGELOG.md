@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- `make probe-plugin`: experimental Core Audio plug-in (`SL3Probe.driver`) that only checks whether a HAL plug-in can open the SL3 through IOUSBHost. It publishes no device.
 - Lower default latency: about 24 ms in and 29 ms out, down from 33 and 45.
 - New options to tune the ring buffers and USB transfer sizes (`--out-target`, `--cap-pkts`, `--cap-xfers`, `--play-pkts`, `--play-xfers`).
 - Status output shows the estimated latency and USB packet rates.
