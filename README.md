@@ -39,8 +39,11 @@ Quit your audio apps, then build and install:
 
 ```sh
 make device-plugin
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver
 sudo cp -R build/SL3Device.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
 ```
+
+The `rm` matters when upgrading: copying over an installed driver replaces the file in place, macOS then rejects it on a code signature mismatch, and the driver doesn't load.
 
 `killall coreaudiod` restarts the macOS audio service so it loads the driver; sound on the Mac stops for a moment. Plug in the SL3 and **Rane SL3** appears in Audio MIDI Setup and in your apps.
 

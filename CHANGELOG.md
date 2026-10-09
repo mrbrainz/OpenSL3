@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- README: remove the old driver before copying the new one; copying over it makes macOS reject the driver.
+
 ## [1.0.1] - 2026-10-09
 
 - Project renamed to OpenSL3 (previously sl3-bridge).
