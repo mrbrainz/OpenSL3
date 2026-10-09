@@ -13,11 +13,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 
 #define MAXCH 16
 #define MAXF (44100 * 30)
 static float *g_buf;
 static UInt32 g_ch, g_n, g_max;
+/* callback timing */
+static double g_last_host, g_max_gap, g_min_gap = 1e9, g_last_st = -1, g_rs_min = 9, g_rs_max = 0;
+static long g_calls, g_st_jumps;
+static UInt32 g_frames_last;
+static double g_tick_ms;
 
 static AudioDeviceID find_device(const char *needle) {
     AudioObjectPropertyAddress a = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -41,10 +47,27 @@ static AudioDeviceID find_device(const char *needle) {
 static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in,
                         const AudioTimeStamp *in_t, AudioBufferList *out, const AudioTimeStamp *out_t, void *ctx) {
     (void)dev; (void)now; (void)in_t; (void)out; (void)out_t; (void)ctx;
+    (void)now;
+    if (in_t && (in_t->mFlags & kAudioTimeStampHostTimeValid)) {
+        double h = in_t->mHostTime * g_tick_ms;
+        if (g_calls > 20) {   /* skip startup */
+            double gap = h - g_last_host;
+            if (gap > g_max_gap) g_max_gap = gap;
+            if (gap < g_min_gap) g_min_gap = gap;
+            if (in_t->mSampleTime != g_last_st + g_frames_last) g_st_jumps++;
+            if (in_t->mFlags & kAudioTimeStampRateScalarValid) {
+                if (in_t->mRateScalar < g_rs_min) g_rs_min = in_t->mRateScalar;
+                if (in_t->mRateScalar > g_rs_max) g_rs_max = in_t->mRateScalar;
+            }
+        }
+        g_last_host = h; g_last_st = in_t->mSampleTime;
+    }
+    g_calls++;
     if (!in->mNumberBuffers) return noErr;
     const AudioBuffer *b = &in->mBuffers[0];
     UInt32 ch = b->mNumberChannels, frames = b->mDataByteSize / (sizeof(float) * ch);
     const float *p = b->mData;
+    g_frames_last = frames;
     for (UInt32 f = 0; f < frames && g_n < g_max; f++, g_n++)
         for (UInt32 c = 0; c < g_ch; c++) g_buf[g_n * g_ch + c] = c < ch ? p[f * ch + c] : 0;
     return noErr;
@@ -53,10 +76,13 @@ static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now, const Audi
 int main(int argc, char **argv) {
     const char *name = "Rane SL3";
     double secs = 5;
+    UInt32 bufsz = 0;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb); g_tick_ms = (double)tb.numer / tb.denom / 1e6;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) secs = atof(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--device NAME] [--seconds N]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--buffer") && i + 1 < argc) bufsz = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: %s [--device NAME] [--seconds N] [--buffer FRAMES]\n", argv[0]); return 2; }
     }
     AudioDeviceID dev = find_device(name);
     if (!dev) { printf("no device matching \"%s\"\n", name); return 1; }
@@ -68,12 +94,23 @@ int main(int argc, char **argv) {
     if (g_max > MAXF) g_max = MAXF;
     g_buf = calloc((size_t)g_max * g_ch, sizeof(float));
     printf("recording %.1f s from \"%s\": %u ch, %.0f Hz\n", secs, name, (unsigned)g_ch, fmt.mSampleRate);
+    AudioObjectPropertyAddress ba = {kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    if (bufsz) AudioObjectSetPropertyData(dev, &ba, 0, NULL, sizeof bufsz, &bufsz);
+    UInt32 bs = sizeof bufsz; AudioObjectGetPropertyData(dev, &ba, 0, NULL, &bs, &bufsz);
+    UInt32 lat = 0, so = 0, ls = sizeof lat;
+    AudioObjectPropertyAddress la = {kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain};
+    AudioObjectGetPropertyData(dev, &la, 0, NULL, &ls, &lat);
+    la.mSelector = kAudioDevicePropertySafetyOffset; ls = sizeof so;
+    AudioObjectGetPropertyData(dev, &la, 0, NULL, &ls, &so);
+    printf("buffer %u frames, input latency %u, safety offset %u\n", (unsigned)bufsz, (unsigned)lat, (unsigned)so);
     AudioDeviceIOProcID pid;
     if (AudioDeviceCreateIOProcID(dev, io_proc, NULL, &pid) || AudioDeviceStart(dev, pid)) { printf("could not start\n"); return 1; }
     while (g_n < g_max) usleep(100000);
     AudioDeviceStop(dev, pid);
     AudioDeviceDestroyIOProcID(dev, pid);
 
+    printf("callbacks %ld: gap min %.2f max %.2f ms (buffer = %.2f ms), sample-time jumps %ld, rate scalar %.6f..%.6f\n",
+           g_calls, g_min_gap, g_max_gap, bufsz / fmt.mSampleRate * 1000, g_st_jumps, g_rs_min, g_rs_max);
     /* skip the first 0.5 s (startup) */
     UInt32 s0 = (UInt32)(0.5 * fmt.mSampleRate), n = g_n - s0;
     double rms[MAXCH], mean[MAXCH];

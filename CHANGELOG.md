@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- `make device-plugin`: experimental Core Audio driver (`SL3Device.driver`) that makes the SL3 a 6-in/6-out device running on its own clock, with no bridge, BlackHole or resampling.
+- `make device-plugin`: experimental Core Audio driver (`SL3Device.driver`) that makes the SL3 a 6-in/6-out device running on its own clock, with no bridge, BlackHole or resampling. About 18 ms in and 22 ms out plus the app buffer; restarts the USB streams if they stop.
+- New test tools: `sl3rec` (input levels, channel correlation, callback timing), `sl3tone` (sine on all outputs), `sl3loop` (round-trip latency through a loopback cable).
 - `make probe-plugin`: experimental Core Audio plug-in (`SL3Probe.driver`) that only checks whether a HAL plug-in can open the SL3 through IOUSBHost. It publishes no device.
 - Lower default latency: about 24 ms in and 29 ms out, down from 33 and 45.
 - New options to tune the ring buffers and USB transfer sizes (`--out-target`, `--cap-pkts`, `--cap-xfers`, `--play-pkts`, `--play-xfers`).
