@@ -101,7 +101,7 @@ Diagnostic tools used to work out the protocol. None of them is needed to play.
 | `sl3probe` | Print the device descriptors and record the SL3's inputs to a WAV file. Never writes to the control channel |
 | `sl3play` | Play a quiet test tone on output channels 1–2 |
 | `sl3ctl` | Read and write the box's control bytes, and send the heartbeat by hand |
-| `sl3usbtiming` | Measure capture completion timing with IOUSBHost or libusb (`sl3usbtiming [iousbhost|libusb] [seconds] [transfers]`); read-only |
+| `sl3usbtiming` | Measure capture completion timing with IOUSBHost or libusb (`sl3usbtiming MODE [seconds] [transfers]`, MODE is `iousbhost` or `libusb`); read-only |
 
 Stop `sl3bridge` before using `sl3ctl`, because only one process can claim the control interface at a time. **The SL3 keeps its control bytes across power cycles**, so only use `sl3ctl set-control` when you know what a byte does.
 
