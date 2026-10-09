@@ -59,11 +59,12 @@ static void note_gap(double *last, double *maxgap) { double t = ms_now(); if (*l
 #define NCH 6
 #define FRAME_BYTES 18
 #define PKT_MAX 126
-/* microframes queued: capture 16 x 32 = 64 ms, playback 8 x 16 = 16 ms */
-#define CAP_PKTS 32
-#define CAP_NXF 16
-#define PLAY_PKTS 16
-#define PLAY_NXF 8
+/* USB transfers: count x microframes each (125 us). Capture queue depth only
+ * absorbs stalls; playback queue depth adds directly to output latency. */
+#define MAX_NXF 128
+/* Defaults from latency sweeps on an M1 Max: USB callbacks can be ~10 ms apart,
+ * so the playback queue (12 ms) and the input ring must cover that. */
+static int CAP_PKTS = 8, CAP_NXF = 64, PLAY_PKTS = 8, PLAY_NXF = 12;
 #define SKIP_PACKETS 3
 #define RATE 44100.0
 #define BH_IN_FIRST  0   /* BlackHole channel index (0-based) for SL3 input 1 */
@@ -154,7 +155,7 @@ static reader_t rd_in, rd_out; /* rd_in consumed by the IOProc, rd_out by the US
 #define FIFO_N 4096
 static int fifo[FIFO_N];
 static unsigned fifo_w, fifo_r;
-static struct { long cap_pkts, cap_err, play_err, fallback, xfer_err, skip; double acc; int inflight, stop; } U;
+static struct { long cap_pkts, play_pkts, cap_err, play_err, fallback, xfer_err, skip; double acc; int inflight, stop; } U;
 
 static int32_t get24(const uint8_t *p) {
     int32_t v = p[0] | p[1] << 8 | p[2] << 16;
@@ -213,8 +214,10 @@ static void fill_play(struct libusb_transfer *t) {
 
 static void LIBUSB_CALL play_cb(struct libusb_transfer *t) {
     if (t->status == LIBUSB_TRANSFER_COMPLETED) {
-        for (int i = 0; i < t->num_iso_packets; i++)
+        for (int i = 0; i < t->num_iso_packets; i++) {
+            U.play_pkts++;
             if (t->iso_packet_desc[i].status != LIBUSB_TRANSFER_COMPLETED) U.play_err++;
+        }
     } else if (t->status != LIBUSB_TRANSFER_CANCELLED) U.xfer_err++;
     if (U.stop || t->status == LIBUSB_TRANSFER_CANCELLED || t->status == LIBUSB_TRANSFER_NO_DEVICE) { U.inflight--; return; }
     fill_play(t);
@@ -431,7 +434,7 @@ static int get_prop(AudioDeviceID d, AudioObjectPropertySelector sel, AudioObjec
 
 /* ---- SL3 session: open, stream, and tear down (repeatable for reconnects) ---- */
 static libusb_device_handle *g_dev;
-static struct libusb_transfer *g_cx[CAP_NXF], *g_px[PLAY_NXF];
+static struct libusb_transfer *g_cx[MAX_NXF], *g_px[MAX_NXF];
 static int g_hid_ok;
 static pthread_t g_usb_th;
 
@@ -522,12 +525,22 @@ static void sl3_disconnect(int present) {
 int main(int argc, char **argv) {
     const char *devname = "BlackHole 16ch";
     UInt32 bufsz = 256;
-    double target = 0;
+    double target = 0, out_target = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) devname = argv[++i];
         else if (!strcmp(argv[i], "--buffer") && i + 1 < argc) bufsz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--target") && i + 1 < argc) target = atof(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--device NAME] [--buffer FRAMES] [--target FRAMES]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--out-target") && i + 1 < argc) out_target = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cap-pkts") && i + 1 < argc) CAP_PKTS = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cap-xfers") && i + 1 < argc) CAP_NXF = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--play-pkts") && i + 1 < argc) PLAY_PKTS = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--play-xfers") && i + 1 < argc) PLAY_NXF = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: %s [--device NAME] [--buffer FRAMES] [--target FRAMES] [--out-target FRAMES]\n"
+                          "          [--cap-pkts N] [--cap-xfers N] [--play-pkts N] [--play-xfers N]\n", argv[0]); return 2; }
+    }
+    if (CAP_NXF < 2 || CAP_NXF > MAX_NXF || PLAY_NXF < 2 || PLAY_NXF > MAX_NXF ||
+        CAP_PKTS < 1 || CAP_PKTS > 64 || PLAY_PKTS < 1 || PLAY_PKTS > 64) {
+        fprintf(stderr, "transfer counts must be 2..%d, packets per transfer 1..64\n", MAX_NXF); return 2;
     }
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -556,10 +569,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (target <= 0) target = 4.0 * bufsz;
-    printf("  ring target %.0f frames (%.1f ms per direction)\n", target, target / RATE * 1000);
+    if (target <= 0) target = 3.0 * bufsz;
+    if (out_target <= 0) out_target = 2.0 * bufsz;
+    printf("  ring target in %.0f frames (%.1f ms), out %.0f frames (%.1f ms)\n",
+           target, target / RATE * 1000, out_target, out_target / RATE * 1000);
+    printf("  usb: capture %d x %d microframes, playback %d x %d microframes (%.1f ms queued ahead)\n",
+           CAP_NXF, CAP_PKTS, PLAY_NXF, PLAY_PKTS, PLAY_NXF * PLAY_PKTS * 0.125);
+    printf("  estimated latency: in %.1f ms, out %.1f ms\n",
+           (target + bufsz) / RATE * 1000 + CAP_PKTS * 0.125,
+           (out_target + bufsz) / RATE * 1000 + PLAY_NXF * PLAY_PKTS * 0.125);
     reader_init(&rd_in, &g_in, target, 0.02);        /* updated once per IO cycle */
-    reader_init(&rd_out, &g_out, target, 0.0005);    /* updated once per USB transfer (1 ms) */
+    reader_init(&rd_out, &g_out, out_target, 0.0005);    /* updated once per USB transfer (1 ms) */
 
     libusb_init(&g_ctx);
     AudioDeviceIOProcID pid;
@@ -570,7 +590,7 @@ int main(int argc, char **argv) {
     printf("    If the SL3 is unplugged or loses power, the bridge waits for it and reconnects.\n");
 
     int connected = 0, waiting_msg = 0;
-    double t_start = 0; uint64_t uf0 = 0, if0 = 0; int warm = 0;
+    double t_start = 0; uint64_t uf0 = 0, if0 = 0; long cp0 = 0, pp0 = 0; int warm = 0;
     while (!g_stop) {
         if (!connected) {
             if (sl3_connect() == 0) {
@@ -588,8 +608,13 @@ int main(int argc, char **argv) {
             continue;
         }
         sleep(1);
-        if (++warm == 3) { t_start = ms_now(); uf0 = g_usb_frames; if0 = g_io_frames; }
-        if (warm > 3) { double el = (ms_now() - t_start) / 1000; printf("  rates: usb %.1f Hz, coreaudio %.1f Hz\n", (g_usb_frames - uf0) / el, (g_io_frames - if0) / el); }
+        if (++warm == 3) { t_start = ms_now(); uf0 = g_usb_frames; if0 = g_io_frames; cp0 = U.cap_pkts; pp0 = U.play_pkts; }
+        if (warm > 3) {
+            /* both packet rates should be 8000/s; less means microframes were missed */
+            double el = (ms_now() - t_start) / 1000;
+            printf("  rates: usb %.1f Hz, coreaudio %.1f Hz, packets/s cap %.1f play %.1f\n",
+                   (g_usb_frames - uf0) / el, (g_io_frames - if0) / el, (U.cap_pkts - cp0) / el, (U.play_pkts - pp0) / el);
+        }
         printf("  in: fill %5llu ratio %.6f under %llu over %llu reset %llu | out: fill %5llu ratio %.6f under %llu over %llu reset %llu | usb err %ld/%ld/%ld hb %ld/%ld | max gap usb %.1f ms io %.1f ms\n",
                (unsigned long long)ring_fill(&g_in), rd_in.ratio, (unsigned long long)rd_in.underruns, (unsigned long long)g_in.overruns, (unsigned long long)rd_in.resets,
                (unsigned long long)ring_fill(&g_out), rd_out.ratio, (unsigned long long)rd_out.underruns, (unsigned long long)g_out.overruns, (unsigned long long)rd_out.resets,

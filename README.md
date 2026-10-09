@@ -60,7 +60,12 @@ Leave it running while you play. Every second it prints a status line with buffe
 |--------|---------|---------|
 | `--device NAME` | `BlackHole 16ch` | Loopback device to use (matched by substring) |
 | `--buffer FRAMES` | `256` | CoreAudio I/O buffer size |
-| `--target FRAMES` | 4 × buffer | Ring buffer target per direction. This sets the latency: about 23 ms at the defaults |
+| `--target FRAMES` | 3 × buffer | Input ring buffer target (SL3 → Mac) |
+| `--out-target FRAMES` | 2 × buffer | Output ring buffer target (Mac → SL3) |
+| `--cap-pkts N`, `--cap-xfers N` | 8, 64 | Capture USB transfers: microframes each, number queued |
+| `--play-pkts N`, `--play-xfers N` | 8, 12 | Playback USB transfers. The queue depth adds to output latency |
+
+At the defaults the bridge adds about 24 ms on input and 29 ms on output, and prints its estimate at startup. Lower settings can drop audio. Watch the `under` counters and check that both packet rates stay at 8,000 per second.
 
 ## Mixxx setup
 
