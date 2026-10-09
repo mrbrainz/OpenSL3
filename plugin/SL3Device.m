@@ -196,6 +196,9 @@ static io_service_t usb_find(const char *cls, int ifnum) {
     return IOServiceGetMatchingService(kIOMainPortDefault, m);
 }
 static _Atomic int g_present;   /* SL3 attached, from IOKit notifications */
+/* Device listed and alive: while the SL3 is attached, and also while IO runs
+ * without it, so clients keep the same device and resume after a replug. */
+static _Atomic int g_visible;
 static int usb_present(void) { io_service_t s = usb_find("IOUSBHostDevice", -1); if (s) IOObjectRelease(s); return s != 0; }
 
 static IOUSBHostInterface *usb_open(int ifnum) {
@@ -565,18 +568,24 @@ static io_iterator_t g_add_it, g_rem_it;
 
 /* Report the device appearing or disappearing. Runs on g_nq, never from
  * inside a host call. */
-static void presence_changed(int present) {
-    if (atomic_exchange(&g_present, present) == present) return;
-    os_log(g_log, "SL3 %{public}s", present ? "attached" : "detached");
-    /* streams fail on their own when the box goes; stop them now rather than
-     * at the next stats tick, and restart once it is back */
-    if (g_io_clients > 0) { if (!present) g_stop = 1; if (g_stop) kick_restart(); }
+static void update_visibility(void) {
+    int v = g_present || g_io_clients > 0;
+    if (atomic_exchange(&g_visible, v) == v) return;
+    os_log(g_log, "device %{public}s", v ? "shown" : "hidden");
     AudioObjectPropertyAddress pa[2] = {
         {kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
         {kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}};
     AudioObjectPropertyAddress da = {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     g_host->PropertiesChanged(g_host, kObjDevice, 1, &da);
     g_host->PropertiesChanged(g_host, kAudioObjectPlugInObject, 2, pa);
+}
+static void presence_changed(int present) {
+    if (atomic_exchange(&g_present, present) == present) return;
+    os_log(g_log, "SL3 %{public}s", present ? "attached" : "detached");
+    /* streams fail on their own when the box goes; stop them now rather than
+     * at the next stats tick, and restart once it is back */
+    if (g_io_clients > 0) { if (!present) g_stop = 1; if (g_stop) kick_restart(); }
+    update_visibility();
 }
 static int drain(io_iterator_t it) {
     int n = 0; io_object_t o;
@@ -598,7 +607,7 @@ static void hotplug_start(void) {
         else IOServiceAddMatchingNotification(g_nport, kIOTerminatedNotification, m, on_removed, NULL, &g_rem_it);
     }
     /* arm both iterators; the initial state is set without notifying the host */
-    dispatch_sync(g_nq, ^{ g_present = drain(g_add_it) > 0; drain(g_rem_it); });
+    dispatch_sync(g_nq, ^{ g_present = g_visible = drain(g_add_it) > 0; drain(g_rem_it); });
 }
 
 /* ---- AudioServerPlugIn driver interface ---- */
@@ -643,11 +652,11 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioObjectPropertyOwner: RET(AudioObjectID, kAudioObjectUnknown);
         case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("sl3-bridge"));
         case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList:
-            if (!g_present) return 0;
+            if (!g_visible) return 0;
             RET(AudioObjectID, kObjDevice);
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             CFStringRef uid = qual ? *(const CFStringRef *)qual : NULL;
-            RET(AudioObjectID, g_present && uid && CFEqual(uid, DEVICE_UID) ? kObjDevice : kAudioObjectUnknown);
+            RET(AudioObjectID, g_visible && uid && CFEqual(uid, DEVICE_UID) ? kObjDevice : kAudioObjectUnknown);
         }
         case kAudioPlugInPropertyResourceBundle: RET(CFStringRef, CFSTR(""));
         }
@@ -664,7 +673,7 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioDevicePropertyTransportType: RET(UInt32, kAudioDeviceTransportTypeUSB);
         case kAudioDevicePropertyRelatedDevices: RET(AudioObjectID, kObjDevice);
         case kAudioDevicePropertyClockDomain: RET(UInt32, 0);
-        case kAudioDevicePropertyDeviceIsAlive: RET(UInt32, g_present);
+        case kAudioDevicePropertyDeviceIsAlive: RET(UInt32, g_visible);
         case kAudioDevicePropertyDeviceIsRunning: RET(UInt32, g_io_clients > 0);
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: RET(UInt32, 1);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RET(UInt32, 0);
@@ -709,7 +718,7 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
 static int prop_empty(AudioObjectID o, const AudioObjectPropertyAddress *a) {
     return (o == kObjDevice && a->mSelector == kAudioObjectPropertyControlList) ||
            (o == kObjPlugIn && a->mSelector == kAudioPlugInPropertyBoxList) ||
-           (o == kObjPlugIn && !g_present && (a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioPlugInPropertyDeviceList)) ||
+           (o == kObjPlugIn && !g_visible && (a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioPlugInPropertyDeviceList)) ||
            ((o == kObjStreamIn || o == kObjStreamOut) && a->mSelector == kAudioObjectPropertyOwnedObjects);
 }
 
@@ -803,8 +812,12 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) 
     pthread_mutex_lock(&g_lock);
     int last = g_io_clients == 1;
     if (g_io_clients > 0) g_io_clients--;
-    if (last) usb_close(1);
+    if (last) usb_close(g_present);
     pthread_mutex_unlock(&g_lock);
+    /* the box went while running: hide the device now IO is over, later and
+     * from our own queue rather than inside StopIO */
+    if (last && !g_present && g_nq)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_nq, ^{ update_visibility(); });
     return noErr;
 }
 

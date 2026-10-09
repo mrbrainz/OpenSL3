@@ -112,7 +112,7 @@ In Mixxx, select **Rane SL3** for every input and output at 44,100 Hz:
 
 Don't put another card (headphones, a control CD player) in the same Mixxx setup without drift correction: two clocks cause distortion and pitch jumps.
 
-The decks switch to USB audio when an app starts using the device and back to analog thru when the last one stops. If the SL3 is unplugged, it disappears from Core Audio and running apps lose it; it reappears when plugged back in, and apps need to select it or start audio again.
+The decks switch to USB audio when an app starts using the device and back to analog thru when the last one stops. If the SL3 is unplugged while an app uses it, the device stays in place (the decks fall back to analog thru) and audio resumes when it is plugged back in. When nothing uses it, an unplugged SL3 disappears from Core Audio until it is back; apps such as Mixxx only see it again after a restart.
 
 Limitations: 44,100 Hz only; no volume controls. The driver logs to the unified log: `log stream --predicate 'subsystem == "sl3.device"'`. `build/sl3plugtest` loads the driver outside Core Audio to check it (stop any app using the SL3 first).
 

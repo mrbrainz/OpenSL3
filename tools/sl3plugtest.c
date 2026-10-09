@@ -105,7 +105,16 @@ static int hotplug(AudioServerPlugInDriverRef d, int secs) {
         if (g_notes != seen) { seen = g_notes; int b = quiet_walk(d); bad += b; printf("       property walk: %d problems\n", b); }
         fflush(stdout);
     }
-    printf("StopIO %d\n== %d property problems, %d host notifications\n", (int)(*d)->StopIO(d, 2, 1), bad, g_notes);
+    printf("StopIO %d\n", (int)(*d)->StopIO(d, 2, 1));
+    for (int t = 0; t < 3; t++) {   /* the device may hide after IO stops */
+        sleep(1);
+        UInt32 v = 9, sz = 0, out;
+        (*d)->GetPropertyData(d, 2, getpid(), &alive, 0, NULL, 4, &out, &v);
+        (*d)->GetPropertyDataSize(d, kAudioObjectPlugInObject, getpid(), &list, 0, NULL, &sz);
+        printf("after stop %d s: alive %u, devices %u\n", t + 1, v, sz / 4);
+    }
+    bad += quiet_walk(d);
+    printf("== %d property problems, %d host notifications\n", bad, g_notes);
     return bad != 0;
 }
 
