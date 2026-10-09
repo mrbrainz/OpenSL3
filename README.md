@@ -79,6 +79,8 @@ At the defaults the bridge adds about 24 ms on input and 29 ms on output, and pr
 
 Never send any Mixxx output to channels 1–6: BlackHole mixes every client's output together, so it would leak into the timecode.
 
+Set Mixxx's **audio buffer** (Preferences → Sound Hardware) as low as plays without dropouts, for example about 5 ms. It adds to the latency on top of the bridge's own buffering.
+
 **Preferences → Vinyl Control:** set the vinyl type for each deck (for example *Serato CV02 Vinyl*, or *Serato CD* for the control CD). Turn on vinyl control on each deck, in ABS mode for needle dropping. Deck 3 needs a skin that shows four decks.
 
 ## Failure behaviour
