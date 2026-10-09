@@ -30,12 +30,47 @@ How the SL3's USB protocol works is documented in [docs/PROTOCOL.md](docs/PROTOC
 ## Requirements
 
 - An Apple Silicon Mac with macOS 12 Monterey or later (tested on macOS 27). Intel Macs should also work, but haven't been tested.
-- To build: the Xcode command line tools (`xcode-select --install`).
 - [Mixxx] or other DJ software that supports timecode control.
 
 ## Install
 
-Quit your audio apps, then build and install:
+Requires macOS 12 or later. Quit any audio apps first.
+
+1. Download the latest `OpenSL3-x.y.z.zip` from [Releases](https://github.com/mrbrainz/OpenSL3/releases).
+2. Unzip it and remove the download quarantine, so macOS will load the driver:
+   ```sh
+   cd ~/Downloads
+   unzip OpenSL3-x.y.z.zip
+   xattr -dr com.apple.quarantine SL3Device.driver
+   ```
+   (If your browser already unzipped it, skip the `unzip` line.)
+3. Move the driver into place and restart the audio service:
+   ```sh
+   sudo mv SL3Device.driver /Library/Audio/Plug-Ins/HAL/
+   sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
+   ```
+   Restarting the audio service (`coreaudiod`) makes it load the driver; sound on the Mac stops for a moment.
+4. Plug in the SL3. **Rane SL3** appears in Audio MIDI Setup and in your apps.
+
+### Upgrade
+
+Same as installing, but remove the old driver first. Moving the new one onto an installed driver would put it inside the old bundle rather than replacing it. After steps 1 and 2:
+
+```sh
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver
+sudo mv SL3Device.driver /Library/Audio/Plug-Ins/HAL/
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
+```
+
+### Uninstall
+
+```sh
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
+```
+
+### Build from source
+
+Needs the Xcode command line tools (`xcode-select --install`):
 
 ```sh
 make device-plugin
@@ -43,17 +78,7 @@ sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver
 sudo cp -R build/SL3Device.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
 ```
 
-The `rm` matters when upgrading: copying over an installed driver replaces the file in place, macOS then rejects it on a code signature mismatch, and the driver doesn't load.
-
-`killall coreaudiod` restarts the macOS audio service so it loads the driver; sound on the Mac stops for a moment. Plug in the SL3 and **Rane SL3** appears in Audio MIDI Setup and in your apps.
-
-If you install from a release download instead, unzip it first and remove the download quarantine before copying (`xattr -dr com.apple.quarantine SL3Device.driver`).
-
-To uninstall:
-
-```sh
-sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
-```
+Always remove the installed driver first: copying over it rewrites the file in place, and macOS then rejects it on a code signature mismatch.
 
 ## Mixxx setup
 

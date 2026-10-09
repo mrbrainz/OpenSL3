@@ -1,10 +1,10 @@
 # Changelog
 
-## [1.0.2] - 2026-10-09
+## [Unreleased]
 
 - `sl3rec` reports the dominant frequency of each channel (for example a 1 kHz timecode carrier), to check that input runs at the right rate.
 - README: recommend 44.1 kHz in Mixxx (its vinyl control can start at 44.1 kHz while the device runs at 48 kHz); troubleshooting for a stuck AirPlay helper.
-- README: remove the old driver before copying the new one; copying over it makes macOS reject the driver.
+- README: install from the release download by moving the driver into place; remove the old driver first when upgrading.
 
 ## [1.0.1] - 2026-10-09
 
