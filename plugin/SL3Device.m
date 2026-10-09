@@ -158,6 +158,7 @@ static double g_acc;
 static uint32_t g_hid_seq = 1, g_hb_seq;
 static int g_hb_busy;
 static dispatch_source_t g_hb_timer;
+static float g_pk_hal[NCH], g_pk_usb[NCH];   /* output peaks written by the HAL / sent to USB */
 static uint64_t g_in_next, g_out_next;   /* expected next HAL sample times */
 static dispatch_source_t g_stat_timer;
 
@@ -271,6 +272,7 @@ static void play_submit(int i) {
         for (int f = 0; f < n; f++) {
             float fr[NCH];
             if (!sring_get(&g_out, g_play_s, fr)) S.out_miss++;
+            for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_usb[c]) g_pk_usb[c] = a; }
             g_play_s++;
             uint8_t *q = p + off + f * FRAME_BYTES;
             for (int c = 0; c < NCH; c++) {
@@ -393,6 +395,12 @@ static void usb_restart(void) {
 }
 
 static void log_stats(const char *tag) {
+    char pk[200]; int o = 0;
+    o += snprintf(pk + o, sizeof pk - o, "out peaks hal");
+    for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_hal[c]); g_pk_hal[c] = 0; }
+    o += snprintf(pk + o, sizeof pk - o, " usb");
+    for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_usb[c]); g_pk_usb[c] = 0; }
+    os_log(g_log, "%{public}s: %{public}s", tag, pk);
     os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
            "miss in %ld out %ld, err cap %ld play %ld xfer %ld, hb %ld/%ld",
            tag, S.rate, S.max_err_us, S.resyncs, S.play_resyncs, S.in_jumps, S.out_jumps,
@@ -730,7 +738,10 @@ static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectI
         uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
         if (g_out_next && t != g_out_next) S.out_jumps++;
         g_out_next = t + n;
-        for (UInt32 f = 0; f < n; f++) sring_put(&g_out, t + f, buf + f * NCH);
+        for (UInt32 f = 0; f < n; f++) {
+            sring_put(&g_out, t + f, buf + f * NCH);
+            for (int c = 0; c < NCH; c++) { float a = fabsf(buf[f * NCH + c]); if (a > g_pk_hal[c]) g_pk_hal[c] = a; }
+        }
     }
     return noErr;
 }
