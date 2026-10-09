@@ -105,7 +105,12 @@ int main(int argc, char **argv) {
     printf("buffer %u frames, input latency %u, safety offset %u\n", (unsigned)bufsz, (unsigned)lat, (unsigned)so);
     AudioDeviceIOProcID pid;
     if (AudioDeviceCreateIOProcID(dev, io_proc, NULL, &pid) || AudioDeviceStart(dev, pid)) { printf("could not start\n"); return 1; }
-    while (g_n < g_max) usleep(100000);
+    /* stop waiting if callbacks stop (e.g. the device was unplugged) */
+    for (long last = -1, idle = 0; g_n < g_max && idle < 20; usleep(100000)) {
+        idle = g_n == last ? idle + 1 : 0;
+        last = g_n;
+    }
+    if (g_n < g_max) printf("callbacks stopped after %ld of %ld frames\n", (long)g_n, (long)g_max);
     AudioDeviceStop(dev, pid);
     AudioDeviceDestroyIOProcID(dev, pid);
 
