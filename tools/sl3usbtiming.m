@@ -32,35 +32,53 @@ static volatile int g_stop;
 /* ---- statistics (only touched from the completion thread) ---- */
 #define NBINS 12
 static const double bin_ms[NBINS] = {0.5, 1, 1.5, 2, 3, 4, 6, 8, 10, 15, 20, 1e9};
-static uint64_t hist[NBINS], n_done, n_pkts, n_bad, n_bytes;
-static double tick_ms, last_ms, max_gap, t0_ms;
+typedef struct { uint64_t bins[NBINS], n; double max; } hist_t;
+static hist_t gap_cb, gap_hw, delay;   /* callback gaps; controller timestamp gaps; timestamp to callback */
+static uint64_t n_done, n_pkts, n_bad, n_bytes, n_ts_bad;
+static double tick_ms, last_ms, last_hw_ms, t0_ms;
 
 static double now_ms(void) { return mach_absolute_time() * tick_ms; }
 
-static void record(int good_pkts, int bad_pkts, int bytes) {
+static void hist_add(hist_t *h, double v) {
+    if (v > h->max) h->max = v;
+    int b = 0; while (v > bin_ms[b]) b++;
+    h->bins[b]++; h->n++;
+}
+
+/* hw_ms: controller timestamp of the transfer's last microframe, or 0 if unknown */
+static void record(int good_pkts, int bad_pkts, int bytes, double hw_ms) {
     double t = now_ms();
-    if (last_ms > 0) {
-        double g = t - last_ms;
-        if (g > max_gap) max_gap = g;
-        int b = 0; while (g > bin_ms[b]) b++;
-        hist[b]++;
-    } else t0_ms = t;
+    if (last_ms > 0) hist_add(&gap_cb, t - last_ms); else t0_ms = t;
     last_ms = t;
+    if (hw_ms > 0) {
+        if (hw_ms > t + 1) n_ts_bad++;   /* timestamp not in mach time units */
+        else hist_add(&delay, t - hw_ms);
+        if (last_hw_ms > 0) hist_add(&gap_hw, hw_ms - last_hw_ms);
+        last_hw_ms = hw_ms;
+    }
     n_done++; n_pkts += good_pkts; n_bad += bad_pkts; n_bytes += bytes;
+}
+
+static void hist_print(const char *title, const hist_t *h) {
+    if (!h->n) return;
+    printf("%s (max %.2f ms):\n", title, h->max);
+    double lo = 0;
+    for (int b = 0; b < NBINS; b++) {
+        if (b < NBINS - 1) printf("  %5.1f-%5.1f ms: %8llu", lo, bin_ms[b], h->bins[b]);
+        else printf("  >%9.1f ms: %8llu", lo, h->bins[b]);
+        printf("  %7.3f%%\n", 100.0 * h->bins[b] / h->n);
+        lo = bin_ms[b];
+    }
 }
 
 static void report(const char *mode) {
     double el = (last_ms - t0_ms) / 1000;
     printf("\n%s: %llu completions in %.1f s, %.0f packets/s (expect 8000), %llu bad packets, %.0f bytes/s\n",
            mode, n_done, el, n_pkts / el, n_bad, n_bytes / el);
-    printf("max gap between completions: %.2f ms\n", max_gap);
-    double lo = 0;
-    for (int b = 0; b < NBINS; b++) {
-        if (b < NBINS - 1) printf("  %5.1f-%5.1f ms: %8llu", lo, bin_ms[b], hist[b]);
-        else printf("  >%9.1f ms: %8llu", lo, hist[b]);
-        printf("  %7.3f%%\n", n_done > 1 ? 100.0 * hist[b] / (n_done - 1) : 0);
-        lo = bin_ms[b];
-    }
+    hist_print("gaps between completion callbacks", &gap_cb);
+    hist_print("gaps between controller timestamps", &gap_hw);
+    hist_print("delay from controller timestamp to callback", &delay);
+    if (n_ts_bad) printf("%llu controller timestamps were later than the callback (ignored)\n", n_ts_bad);
 }
 
 static void make_realtime(void) {
@@ -85,7 +103,7 @@ static void LIBUSB_CALL lu_cb(struct libusb_transfer *t) {
             if (t->iso_packet_desc[i].status == LIBUSB_TRANSFER_COMPLETED) { good++; bytes += t->iso_packet_desc[i].actual_length; }
             else bad++;
         }
-        record(good, bad, bytes);
+        record(good, bad, bytes, 0);
     }
     if (g_stop || t->status == LIBUSB_TRANSFER_CANCELLED || libusb_submit_transfer(t) != 0) g_inflight--;
 }
@@ -194,7 +212,7 @@ static int run_iousbhost(void) {
                 for (int k = 0; k < PKTS; k++) {
                     if (done[k].status == kIOReturnSuccess) { good++; bytes += done[k].completeCount; } else bad++;
                 }
-                record(good, bad, bytes);
+                record(good, bad, bytes, done[PKTS - 1].timeStamp * tick_ms);
             }
             submit(i);
         }];
