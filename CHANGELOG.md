@@ -1,15 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.0] - 2026-10-09
 
+The Core Audio driver (`SL3Device.driver`) is now the way to use the SL3; the bridge is kept and documented in `docs/BRIDGE.md`.
+
+- README rewritten around the driver; bridge documentation moved to `docs/BRIDGE.md`.
 - `sl3bridge` sets the box to 44.1 kHz at start, so a box left at 48 kHz (by the Core Audio driver or Rane's driver) no longer runs off speed.
 - `SL3Device.driver`: 44.1 and 48 kHz, chosen in Audio MIDI Setup or the app and remembered. The driver now sets the box's rate at every start, so a box left at another rate (for example by Rane's driver) no longer runs off speed.
 - `sl3ctl set-rate 44100|48000` sets the box's sample rate (vendor command `0x31`). The rate survives power cycles.
-- README: Core Audio driver install, removal and Mixxx setup.
 - `SL3Device.driver`: hot-plug. Apps using the SL3 keep the device through an unplug (the decks fall back to thru) and resume when it is plugged in again; when nothing uses it, an unplugged SL3 disappears from Core Audio until it is back.
 - `SL3Device.driver`: fixed coreaudiod spinning at high CPU (and Core Audio apps hanging) after a few device start/stop cycles.
 - New `sl3plugtest` tool (built by `make device-plugin`): loads the driver outside Core Audio, checks every property and cycles IO start/stop.
-- `make device-plugin`: experimental Core Audio driver (`SL3Device.driver`) that makes the SL3 a 6-in/6-out device running on its own clock, with no bridge, BlackHole or resampling. About 18 ms in and 22 ms out plus the app buffer; restarts the USB streams if they stop.
+- `make device-plugin`: Core Audio driver (`SL3Device.driver`) that makes the SL3 a 6-in/6-out device running on its own clock, with no bridge, BlackHole or resampling. About 18 ms in and 22 ms out plus the app buffer; restarts the USB streams if they stop.
 - New test tools: `sl3rec` (input levels, channel correlation, callback timing), `sl3tone` (sine on all outputs), `sl3loop` (round-trip latency through a loopback cable).
 - `make probe-plugin`: experimental Core Audio plug-in (`SL3Probe.driver`) that only checks whether a HAL plug-in can open the SL3 through IOUSBHost. It publishes no device.
 - Lower default latency: about 24 ms in and 29 ms out, down from 33 and 45.
