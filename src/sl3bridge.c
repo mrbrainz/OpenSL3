@@ -163,35 +163,27 @@ static int32_t get24(const uint8_t *p) {
 }
 static void put24(uint8_t *p, int32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; }
 
-static void LIBUSB_CALL cap_cb(struct libusb_transfer *t) {
-    static double last; note_gap(&last, &g_gap_usb);
-    if (t->status == LIBUSB_TRANSFER_COMPLETED) {
-        for (int i = 0; i < t->num_iso_packets; i++) {
-            struct libusb_iso_packet_descriptor *pd = &t->iso_packet_desc[i];
-            U.cap_pkts++;
-            if (pd->status != LIBUSB_TRANSFER_COMPLETED) { U.cap_err++; continue; }
-            int n = pd->actual_length / FRAME_BYTES;
-            if (fifo_w - fifo_r < FIFO_N) fifo[fifo_w++ % FIFO_N] = n;
-            if (U.skip < SKIP_PACKETS) { U.skip++; continue; }
-            const uint8_t *p = libusb_get_iso_packet_buffer_simple(t, i);
-            for (int f = 0; f < n; f++) {
-                float fr[NCH];
-                for (int c = 0; c < NCH; c++) fr[c] = get24(p + f * FRAME_BYTES + c * 3) / 8388608.0f;
-                ring_push(&g_in, fr);
-                peak(g_pk_in, fr);
-                g_usb_frames++;
-            }
-        }
-    } else if (t->status != LIBUSB_TRANSFER_CANCELLED) U.xfer_err++;
-    if (U.stop || t->status == LIBUSB_TRANSFER_CANCELLED || t->status == LIBUSB_TRANSFER_NO_DEVICE) { U.inflight--; return; }
-    if (libusb_submit_transfer(t) != 0) { U.inflight--; U.stop = 1; }
+/* One captured microframe. Its size also sets the size of a later playback packet. */
+static void cap_packet(const uint8_t *p, int len, int ok) {
+    U.cap_pkts++;
+    if (!ok) { U.cap_err++; return; }
+    int n = len / FRAME_BYTES;
+    if (fifo_w - fifo_r < FIFO_N) fifo[fifo_w++ % FIFO_N] = n;
+    if (U.skip < SKIP_PACKETS) { U.skip++; return; }
+    for (int f = 0; f < n; f++) {
+        float fr[NCH];
+        for (int c = 0; c < NCH; c++) fr[c] = get24(p + f * FRAME_BYTES + c * 3) / 8388608.0f;
+        ring_push(&g_in, fr);
+        peak(g_pk_in, fr);
+        g_usb_frames++;
+    }
 }
 
-static void fill_play(struct libusb_transfer *t) {
-    uint8_t *p = t->buffer;
+/* Fill npkts playback microframes into buf back to back; returns total bytes. */
+static int fill_play_buf(uint8_t *p, int npkts, int *lens) {
     int total = 0;
     reader_update(&rd_out);
-    for (int i = 0; i < t->num_iso_packets; i++) {
+    for (int i = 0; i < npkts; i++) {
         int n;
         if (fifo_r != fifo_w) n = fifo[fifo_r++ % FIFO_N];
         else { U.fallback++; U.acc += RATE * 125e-6; n = (int)U.acc; U.acc -= n; }
@@ -206,10 +198,28 @@ static void fill_play(struct libusb_transfer *t) {
                 put24(p + total + f * FRAME_BYTES + c * 3, (int32_t)lrintf(v * 8388607.0f));
             }
         }
-        t->iso_packet_desc[i].length = n * FRAME_BYTES;
+        lens[i] = n * FRAME_BYTES;
         total += n * FRAME_BYTES;
     }
-    t->length = total;
+    return total;
+}
+
+#ifndef SL3_IOUSBHOST
+static void LIBUSB_CALL cap_cb(struct libusb_transfer *t) {
+    static double last; note_gap(&last, &g_gap_usb);
+    if (t->status == LIBUSB_TRANSFER_COMPLETED) {
+        for (int i = 0; i < t->num_iso_packets; i++)
+            cap_packet(libusb_get_iso_packet_buffer_simple(t, i), t->iso_packet_desc[i].actual_length,
+                       t->iso_packet_desc[i].status == LIBUSB_TRANSFER_COMPLETED);
+    } else if (t->status != LIBUSB_TRANSFER_CANCELLED) U.xfer_err++;
+    if (U.stop || t->status == LIBUSB_TRANSFER_CANCELLED || t->status == LIBUSB_TRANSFER_NO_DEVICE) { U.inflight--; return; }
+    if (libusb_submit_transfer(t) != 0) { U.inflight--; U.stop = 1; }
+}
+
+static void fill_play(struct libusb_transfer *t) {
+    int lens[64];
+    t->length = fill_play_buf(t->buffer, t->num_iso_packets, lens);
+    for (int i = 0; i < t->num_iso_packets; i++) t->iso_packet_desc[i].length = lens[i];
 }
 
 static void LIBUSB_CALL play_cb(struct libusb_transfer *t) {
@@ -223,6 +233,7 @@ static void LIBUSB_CALL play_cb(struct libusb_transfer *t) {
     fill_play(t);
     if (libusb_submit_transfer(t) != 0) { U.inflight--; U.stop = 1; }
 }
+#endif
 
 static libusb_context *g_ctx;
 
@@ -355,6 +366,10 @@ static void *usb_thread(void *arg) {
     return NULL;
 }
 
+#ifdef SL3_IOUSBHOST
+#include "iousbhost_streams.m"
+#endif
+
 /* ---- CoreAudio side ---- */
 static AudioDeviceID find_device(const char *needle) {
     AudioObjectPropertyAddress a = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -439,19 +454,26 @@ static int g_hid_ok;
 static pthread_t g_usb_th;
 
 static int sl3_connect(void) {
+    int r;
+#ifdef SL3_IOUSBHOST
+    if (ioh_open_streams()) return -1;
+    /* interface 3 still goes through libusb */
+    libusb_device_handle *h = libusb_open_device_with_vid_pid(g_ctx, VID, PID);
+    if (!h) printf("  warning: libusb could not open the SL3; box will stay in thru\n");
+#else
     libusb_device_handle *h = libusb_open_device_with_vid_pid(g_ctx, VID, PID);
     if (!h) return -1;
     printf("[SL3] connected\n");
     int cfg = 0; libusb_get_configuration(h, &cfg);
     if (cfg != 1) libusb_set_configuration(h, 1);
     libusb_claim_interface(h, IF_AC);
-    int r;
     if ((r = libusb_claim_interface(h, IF_CAP)) || (r = libusb_set_interface_alt_setting(h, IF_CAP, 1)) ||
         (r = libusb_claim_interface(h, IF_PLAY)) || (r = libusb_set_interface_alt_setting(h, IF_PLAY, 1))) {
         printf("  interface setup failed: %s\n", libusb_error_name(r));
         libusb_close(h);
         return -1;
     }
+#endif
 
     /* fresh USB-side state; the CoreAudio side keeps running throughout */
     memset(&U, 0, sizeof U);
@@ -460,6 +482,12 @@ static int sl3_connect(void) {
     g_hb_out = g_hb_in = NULL;
     g_hb_busy = 0; g_hb_sent = g_hb_replies = 0;
 
+#ifdef SL3_IOUSBHOST
+    if (ioh_start_streams()) printf("  could not start audio streams\n");   /* U.stop is set; main loop reconnects */
+    g_h = g_dev = h;
+    g_hid_ok = h && (r = libusb_claim_interface(h, IF_HID)) == 0;
+    if (h && !g_hid_ok) printf("  warning: claim interface 3 failed (%s); box will stay in thru\n", libusb_error_name(r));
+#else
     for (int i = 0; i < CAP_NXF; i++) {
         g_cx[i] = libusb_alloc_transfer(CAP_PKTS);
         libusb_fill_iso_transfer(g_cx[i], h, EP_CAP, malloc(CAP_PKTS * PKT_MAX), CAP_PKTS * PKT_MAX, CAP_PKTS, cap_cb, NULL, 1000);
@@ -478,7 +506,8 @@ static int sl3_connect(void) {
     g_h = g_dev = h;
     g_hid_ok = (r = libusb_claim_interface(h, IF_HID)) == 0;
     if (!g_hid_ok) printf("  warning: claim interface 3 failed (%s); box will stay in thru\n", libusb_error_name(r));
-    else {
+#endif
+    if (g_hid_ok) {
         set_usb_switches(0x01);
         if (heartbeat_start()) printf("  warning: could not start heartbeat\n");
     }
@@ -491,8 +520,12 @@ static int sl3_connect(void) {
 static void sl3_disconnect(int present) {
     libusb_device_handle *h = g_dev;
     U.stop = 1;
+#ifdef SL3_IOUSBHOST
+    ioh_stop_streams(present);
+#else
     for (int i = 0; i < CAP_NXF; i++) libusb_cancel_transfer(g_cx[i]);
     for (int i = 0; i < PLAY_NXF; i++) libusb_cancel_transfer(g_px[i]);
+#endif
     heartbeat_cancel();
     pthread_join(g_usb_th, NULL);
     int drained = U.inflight <= 0;
@@ -502,6 +535,15 @@ static void sl3_disconnect(int present) {
     }
     if (g_hid_ok) libusb_release_interface(h, IF_HID);
     printf("  heartbeat: sent %ld, replies %ld\n", g_hb_sent, g_hb_replies);
+#ifdef SL3_IOUSBHOST
+    if (g_hb_out && drained) libusb_free_transfer(g_hb_out);
+    if (g_hb_in && drained) libusb_free_transfer(g_hb_in);
+    g_hb_out = g_hb_in = NULL;
+    if (h) libusb_close(h);
+    g_dev = g_h = NULL;
+    fflush(stdout);
+    return;
+#endif
     if (present) {
         libusb_set_interface_alt_setting(h, IF_PLAY, 0);
         libusb_set_interface_alt_setting(h, IF_CAP, 0);
@@ -542,6 +584,9 @@ int main(int argc, char **argv) {
         CAP_PKTS < 1 || CAP_PKTS > 64 || PLAY_PKTS < 1 || PLAY_PKTS > 64) {
         fprintf(stderr, "transfer counts must be 2..%d, packets per transfer 1..64\n", MAX_NXF); return 2;
     }
+#ifdef SL3_IOUSBHOST
+    if (CAP_PKTS % 8 || PLAY_PKTS % 8) { fprintf(stderr, "packets per transfer must be a multiple of 8 (1 ms)\n"); return 2; }
+#endif
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
     signal(SIGHUP, on_sigint);   /* terminal closed: still hand the decks back to thru */

@@ -4,7 +4,7 @@ CFLAGS  ?= -O2 -Wall -Wextra
 USB     := $(shell pkg-config --cflags --libs libusb-1.0)
 BUILD   := build
 
-PROGS := $(BUILD)/sl3bridge $(BUILD)/sl3probe $(BUILD)/sl3play $(BUILD)/sl3ctl $(BUILD)/sl3usbtiming
+PROGS := $(BUILD)/sl3bridge $(BUILD)/sl3bridge-iousbhost $(BUILD)/sl3probe $(BUILD)/sl3play $(BUILD)/sl3ctl $(BUILD)/sl3usbtiming
 
 all: $(PROGS)
 
@@ -13,6 +13,9 @@ $(BUILD):
 
 $(BUILD)/sl3bridge: src/sl3bridge.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(USB) -framework CoreAudio -framework CoreFoundation -lpthread
+
+$(BUILD)/sl3bridge-iousbhost: src/sl3bridge.c src/iousbhost_streams.m | $(BUILD)
+	$(CC) $(CFLAGS) -x objective-c -fobjc-arc -DSL3_IOUSBHOST -o $@ $< $(USB) -framework CoreAudio -framework CoreFoundation -framework Foundation -framework IOKit -framework IOUSBHost -lpthread
 
 $(BUILD)/%: tools/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(USB) -lm
