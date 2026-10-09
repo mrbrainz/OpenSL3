@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * sl3bridge: moves audio between the Rane SL3 (via libusb) and a BlackHole
  * loopback device, so DJ software such as Mixxx can use the SL3.

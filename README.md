@@ -117,6 +117,10 @@ Issues and pull requests are welcome. These would help most:
 
 Please keep each pull request focused on one change, and describe how you tested it on real hardware.
 
+## License
+
+[GPL-3.0-or-later](LICENSE).
+
 ## Disclaimer
 
 This is an independent project. It is not affiliated with or endorsed by Rane or Serato. "Rane", "SL3", "Serato" and "Scratch Live" are trademarks of their respective owners. The project contains no code or files from Rane or Serato.

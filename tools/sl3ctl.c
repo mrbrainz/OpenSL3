@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * sl3ctl: talk to the SL3's vendor control channel (interface 3).
  *

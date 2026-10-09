@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * sl3probe - probe for the Rane SL3 (USB 1cc5:0001) on a modern Mac.
  *
