@@ -3,7 +3,8 @@
  * checks every known property (GetPropertyDataSize vs GetPropertyData) on
  * every object and scope, and cycles StartIO/StopIO. Plays nothing; needs
  * exclusive access to the SL3 (stop any bridge first).
- * Usage: sl3plugtest [bundle] [cycles] */
+ * Usage: sl3plugtest [bundle] [cycles]
+ *        sl3plugtest bundle hotplug SECONDS   (IO running; unplug/replug the box) */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -83,6 +84,31 @@ static int walk(AudioServerPlugInDriverRef d, AudioObjectID o, int depth) {
     return bad;
 }
 
+static int quiet_walk(AudioServerPlugInDriverRef d) {
+    int fd = dup(1); fflush(stdout); freopen("/dev/null", "w", stdout);
+    int bad = walk(d, kAudioObjectPlugInObject, 0);
+    fflush(stdout); dup2(fd, 1); close(fd);
+    return bad;
+}
+static int hotplug(AudioServerPlugInDriverRef d, int secs) {
+    AudioObjectPropertyAddress alive = { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectPropertyAddress list = { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    int bad = 0, seen = 0;
+    printf("StartIO %d\n", (int)(*d)->StartIO(d, 2, 1));
+    for (int t = 0; t < secs; t++) {
+        sleep(1);
+        UInt32 v = 9, sz = 0, out; Float64 st; UInt64 ht, seed;
+        (*d)->GetPropertyData(d, 2, getpid(), &alive, 0, NULL, 4, &out, &v);
+        (*d)->GetPropertyDataSize(d, kAudioObjectPlugInObject, getpid(), &list, 0, NULL, &sz);
+        (*d)->GetZeroTimeStamp(d, 2, 1, &st, &ht, &seed);
+        printf("%3d s: alive %u, devices %u, zts %.0f seed %llu\n", t + 1, v, sz / 4, st, seed);
+        if (g_notes != seen) { seen = g_notes; int b = quiet_walk(d); bad += b; printf("       property walk: %d problems\n", b); }
+        fflush(stdout);
+    }
+    printf("StopIO %d\n== %d property problems, %d host notifications\n", (int)(*d)->StopIO(d, 2, 1), bad, g_notes);
+    return bad != 0;
+}
+
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "build/SL3Device.driver";
     int cycles = argc > 2 ? atoi(argv[2]) : 5;
@@ -94,6 +120,7 @@ int main(int argc, char **argv) {
     AudioServerPlugInDriverRef d = factory(NULL, kAudioServerPlugInTypeUUID);
     AudioServerPlugInHostInterface *hp = &g_host;
     if ((*d)->Initialize(d, hp)) { fprintf(stderr, "Initialize failed\n"); return 1; }
+    if (argc > 3 && !strcmp(argv[2], "hotplug")) return hotplug(d, atoi(argv[3]));
     printf("== property walk (idle)\n");
     int bad = walk(d, kAudioObjectPlugInObject, 0);
     AudioObjectPropertyAddress run = { kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };

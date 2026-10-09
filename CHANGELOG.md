@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- `SL3Device.driver`: hot-plug. The device disappears from Core Audio while the SL3 is unplugged and comes back when it is plugged in again; running streams restart within a second of replugging (previously they never recovered).
 - `SL3Device.driver`: fixed coreaudiod spinning at high CPU (and Core Audio apps hanging) after a few device start/stop cycles.
 - New `sl3plugtest` tool (built by `make device-plugin`): loads the driver outside Core Audio, checks every property and cycles IO start/stop.
 - `make device-plugin`: experimental Core Audio driver (`SL3Device.driver`) that makes the SL3 a 6-in/6-out device running on its own clock, with no bridge, BlackHole or resampling. About 18 ms in and 22 ms out plus the app buffer; restarts the USB streams if they stop.
