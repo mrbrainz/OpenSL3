@@ -1,0 +1,150 @@
+Bus 002 Device 001: ID 1cc5:0001  
+Negotiated speed: High Speed (480Mbps)
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.00
+  bDeviceClass          255 [unknown]
+  bDeviceSubClass       255 [unknown]
+  bDeviceProtocol       255 
+  bMaxPacketSize0        64
+  idVendor           0x1cc5 
+  idProduct          0x0001 
+  bcdDevice            0.00
+  iManufacturer           1 
+  iProduct                2 
+  iSerial                 3 
+  bNumConfigurations      1
+  Configuration Descriptor:
+    bLength                 9
+    bDescriptorType         2
+    wTotalLength       0x00eb
+    bNumInterfaces          4
+    bConfigurationValue     1
+    iConfiguration          0 
+    bmAttributes         0x80
+      (Bus Powered)
+    MaxPower              400mA
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        0
+      bAlternateSetting       0
+      bNumEndpoints           0
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      1 [unknown]
+      bInterfaceProtocol     32 
+      iInterface              4 SL 3 Audio
+      ** UNRECOGNIZED:  09 24 01 00 02 0a 4b 00 00
+      ** UNRECOGNIZED:  08 24 0a 05 03 03 00 00
+      ** UNRECOGNIZED:  11 24 02 01 01 01 00 05 06 00 00 00 00 05 00 00 00
+      ** UNRECOGNIZED:  0c 24 03 02 03 06 00 01 05 00 00 00
+      ** UNRECOGNIZED:  11 24 02 03 03 06 00 05 06 00 00 00 00 0b 00 00 00
+      ** UNRECOGNIZED:  0c 24 03 04 01 01 00 03 05 00 00 00
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        1
+      bAlternateSetting       0
+      bNumEndpoints           0
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      2 [unknown]
+      bInterfaceProtocol     32 
+      iInterface              0 
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        1
+      bAlternateSetting       1
+      bNumEndpoints           1
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      2 [unknown]
+      bInterfaceProtocol     32 
+      iInterface              0 
+      ** UNRECOGNIZED:  10 24 01 01 00 01 01 00 00 00 06 00 00 00 00 05
+      ** UNRECOGNIZED:  06 24 02 01 03 18
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x06  EP 6 OUT
+        bmAttributes            5
+          Transfer Type            Isochronous
+          Synch Type               Asynchronous
+          Usage Type               Data
+        wMaxPacketSize     0x007e  1x 126 bytes
+        bInterval               1
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        2
+      bAlternateSetting       0
+      bNumEndpoints           0
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      2 [unknown]
+      bInterfaceProtocol     32 
+      iInterface              0 
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        2
+      bAlternateSetting       1
+      bNumEndpoints           1
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      2 [unknown]
+      bInterfaceProtocol     32 
+      iInterface              0 
+      ** UNRECOGNIZED:  10 24 01 03 00 01 01 00 00 00 06 00 00 00 00 0b
+      ** UNRECOGNIZED:  06 24 02 01 03 18
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x82  EP 2 IN
+        bmAttributes           37
+          Transfer Type            Isochronous
+          Synch Type               Asynchronous
+          Usage Type               Implicit feedback Data
+        wMaxPacketSize     0x007e  1x 126 bytes
+        bInterval               1
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        3
+      bAlternateSetting       0
+      bNumEndpoints           2
+      bInterfaceClass       255 [unknown]
+      bInterfaceSubClass      0 [unknown]
+      bInterfaceProtocol      0 
+      iInterface              0 
+      ** UNRECOGNIZED:  09 21 10 01 00 01 22 1c 00
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x81  EP 1 IN
+        bmAttributes            3
+          Transfer Type            Interrupt
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0040  1x 64 bytes
+        bInterval               1
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x01  EP 1 OUT
+        bmAttributes            3
+          Transfer Type            Interrupt
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0040  1x 64 bytes
+        bInterval               1
+Device Qualifier (for other device speed):
+  bLength                10
+  bDescriptorType         6
+  bcdUSB               2.00
+  bDeviceClass          255 [unknown]
+  bDeviceSubClass       255 [unknown]
+  bDeviceProtocol       255 
+  bMaxPacketSize0        64
+  bNumConfigurations      1
+can't get debug descriptor: No such file or directory
+Device Status:     0x0000
+  (Bus Powered)
