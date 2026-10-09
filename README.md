@@ -57,7 +57,7 @@ sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaud
 
 ## Mixxx setup
 
-**Preferences → Sound Hardware:** sound API CoreAudio, sample rate 44,100 or 48,000 Hz, and **Rane SL3** for every input and output:
+**Preferences → Sound Hardware:** sound API CoreAudio, sample rate **44,100 Hz** (recommended, see below), and **Rane SL3** for every input and output:
 
 | Output | Channels | | Input | Channels |
 |--------|----------|-|-------|----------|
@@ -71,6 +71,8 @@ Don't add another sound card (headphones, a control CD player) to the same Mixxx
 
 **Preferences → Vinyl Control:** set the vinyl type for each deck (for example *Serato CV02 Vinyl*, or *Serato CD* for the control CD). Turn on vinyl control on each deck, in ABS mode for needle dropping. Deck 3 needs a skin that shows four decks.
 
+**Use 44,100 Hz in Mixxx.** Mixxx 2.5.6 can start its vinyl control at 44,100 Hz even when the sound hardware is set to 48,000 Hz. Timecode then reads about 8% slow, so tracks play pitched down. Clicking **Apply** in Preferences → Sound Hardware after Mixxx starts restarts vinyl control at the right rate, but at 44,100 Hz the problem can't occur.
+
 ## Sample rate
 
 Choose 44,100 or 48,000 Hz in Audio MIDI Setup or in your app. The driver remembers the choice and sets it on the box every time audio starts. (The SL3 keeps its rate across power cycles, so a box last used at another rate is corrected automatically.)
@@ -81,6 +83,8 @@ Choose 44,100 or 48,000 Hz in Audio MIDI Setup or in your app. The driver rememb
 - **An app lost the device after an unplug:** apps that were not playing when it was unplugged, such as Mixxx when idle, only see it again after a restart of the app.
 - **Silence on the decks:** only one program can own the SL3; stop `sl3bridge` or any of the tools below.
 - **Logs:** `log stream --predicate 'subsystem == "sl3.device"'` shows the driver's messages, including clock and USB statistics every 2 seconds while it runs.
+- **Tracks pitched down about 8% in Mixxx:** Mixxx's vinyl control is running at 44,100 Hz while the device runs at 48,000 Hz. Set Mixxx to 44,100 Hz (see Mixxx setup).
+- **The audio service (`coreaudiod`) uses lots of CPU and apps hang, even with the driver removed:** after repeated restarts of the audio service, Apple's AirPlay helper can get stuck re-registering with it. Restart the helper with `sudo killall -9 AirPlayXPCHelper` (macOS relaunches it).
 - **Anything going wrong with the audio service:** uninstall with the command above.
 
 ## Tools

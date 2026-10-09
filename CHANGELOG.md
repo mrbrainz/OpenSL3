@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- README: recommend 44.1 kHz in Mixxx (its vinyl control can start at 44.1 kHz while the device runs at 48 kHz); troubleshooting for a stuck AirPlay helper.
 - README: remove the old driver before copying the new one; copying over it makes macOS reject the driver.
 
 ## [1.0.1] - 2026-10-09
