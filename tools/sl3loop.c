@@ -57,7 +57,7 @@ static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now, const Audi
         memset(p, 0, b->mDataByteSize);
         for (UInt32 f = 0; f < n; f++) {
             long s = (long)out_t->mSampleTime + f, k = s % PERIOD;
-            if (k < BURST && (UInt32)g_out <= ch) p[f * ch + g_out - 1] = (float)(g_amp * sin(2 * M_PI * k / 44.1));
+            if (k < BURST && g_calls > 50 && (UInt32)g_out <= ch) p[f * ch + g_out - 1] = (float)(g_amp * sin(2 * M_PI * k / 44.1));
             if (k == 0 && g_calls > 50) {
                 if (g_armed >= 0) g_missed++;
                 g_armed = (double)s;

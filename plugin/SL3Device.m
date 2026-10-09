@@ -61,12 +61,13 @@
 #ifndef OUT_SAFETY
 #define OUT_SAFETY (PLAY_NXF * 44 + 80)
 #endif
-/* Converter latency (frames) beyond the USB timeline, from sl3loop. */
+/* Converter latency (frames) beyond the USB timeline. sl3loop measured a
+ * steady 47-frame round trip (deck 3 out -> deck 2 in, line), split evenly. */
 #ifndef LAT_IN
-#define LAT_IN  0
+#define LAT_IN  23
 #endif
 #ifndef LAT_OUT
-#define LAT_OUT 0
+#define LAT_OUT 24
 #endif
 
 enum { kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjStreamIn = 3, kObjStreamOut = 4 };
