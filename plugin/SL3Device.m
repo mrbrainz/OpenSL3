@@ -85,6 +85,8 @@ static int sring_get(sring_t *r, uint64_t s, float *fr) {
 }
 static void sring_clear(sring_t *r) { for (int i = 0; i < RING; i++) atomic_store(&r->stamp[i], 0); }
 
+static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies, resyncs, in_jumps, out_jumps, play_resyncs; double max_err_us, rate; } S;
+
 /* ---- clock model: host ticks = a_host + (sample - a_s) * tpf ---- */
 static struct { _Atomic uint32_t seq; double a_s, a_host, tpf; uint64_t seed; int valid; } g_clk;
 
@@ -130,8 +132,10 @@ static void clk_update(double s_end, double t_end) {
     double r = rate_add(t_end * g_tick_ns / 1e6, s_end);
     if (r > 0) tpf = 1e9 / r / g_tick_ns;
     if (!v) { clk_write(s_end, t_end, 1e9 / RATE / g_tick_ns, 1); return; }
+    if (r > 0) S.rate = r;
     double pred = a_h + (s_end - a_s) * tpf, err = t_end - pred;
-    if (fabs(err) > 2e6 / g_tick_ns) { clk_write(s_end, t_end, tpf, 1); return; }   /* >2 ms off: resync */
+    if (fabs(err) * g_tick_ns / 1e3 > S.max_err_us) S.max_err_us = fabs(err) * g_tick_ns / 1e3;
+    if (fabs(err) > 2e6 / g_tick_ns) { S.resyncs++; clk_write(s_end, t_end, tpf, 1); return; }   /* >2 ms off: resync */
     clk_write(s_end, pred + 0.02 * err, tpf, 0);
 }
 
@@ -152,7 +156,8 @@ static double g_acc;
 static uint32_t g_hid_seq = 1, g_hb_seq;
 static int g_hb_busy;
 static dispatch_source_t g_hb_timer;
-static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies; } S;
+static uint64_t g_in_next, g_out_next;   /* expected next HAL sample times */
+static dispatch_source_t g_stat_timer;
 
 static void make_realtime(void) {
     static __thread int done;
@@ -247,6 +252,7 @@ static void play_submit(int i) {
     uint8_t *p = g_pbuf[i].mutableBytes;
     if (g_play_resync) {   /* schedule slipped: re-derive the sample time of this transfer's first frame */
         g_play_resync = 0;
+        S.play_resyncs++;
         g_play_s = (uint64_t)llround(clk_sample_at(usb_frame_host(g_play, g_pframe)));
     }
     int off = 0;
@@ -356,6 +362,13 @@ static void hb_tick(void) {
 
 static void usb_close(int present);
 
+static void log_stats(const char *tag) {
+    os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
+           "miss in %ld out %ld, err cap %ld play %ld xfer %ld, hb %ld/%ld",
+           tag, S.rate, S.max_err_us, S.resyncs, S.play_resyncs, S.in_jumps, S.out_jumps,
+           S.in_miss, S.out_miss, S.cap_err, S.play_err, S.xfer_err, S.hb_replies, S.hb_sent);
+}
+
 static int usb_open_all(void) {
     if (!g_q) {
         dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
@@ -429,6 +442,11 @@ static int usb_open_all(void) {
         os_log_error(g_log, "interface 3 unavailable; decks stay in thru");
         [g_hid destroy]; g_hid = nil; g_hout = g_hin = nil;
     }
+    g_in_next = g_out_next = 0;
+    g_stat_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
+    dispatch_source_set_timer(g_stat_timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_stat_timer, ^{ log_stats("stats"); S.max_err_us = 0; });
+    dispatch_resume(g_stat_timer);
     os_log(g_log, "SL3 streaming");
     return 0;
 }
@@ -437,6 +455,7 @@ static int usb_open_all(void) {
 static void usb_close(int present) {
     g_stop = 1;
     if (g_hb_timer) { dispatch_source_cancel(g_hb_timer); g_hb_timer = nil; }
+    if (g_stat_timer) { dispatch_source_cancel(g_stat_timer); g_stat_timer = nil; }
     [g_cpipe abortWithError:nil];
     [g_ppipe abortWithError:nil];
     [g_hin abortWithError:nil];
@@ -450,8 +469,7 @@ static void usb_close(int present) {
     if (present) { [g_play selectAlternateSetting:0 error:nil]; [g_cap selectAlternateSetting:0 error:nil]; }
     [g_cap destroy]; [g_play destroy];
     if (g_q) dispatch_sync(g_q, ^{});
-    os_log(g_log, "SL3 stopped: cap err %ld, play err %ld, xfer err %ld, in miss %ld, out miss %ld, hb %ld/%ld",
-           S.cap_err, S.play_err, S.xfer_err, S.in_miss, S.out_miss, S.hb_replies, S.hb_sent);
+    log_stats("stopped");
     g_cap = g_play = g_hid = nil;
     g_cpipe = g_ppipe = g_hout = g_hin = nil;
     g_req_out = g_req_in = g_hb_out = g_hb_in = nil;
@@ -665,11 +683,15 @@ static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectI
     float *buf = main;
     if (op == kAudioServerPlugInIOOperationReadInput) {
         uint64_t t = (uint64_t)llround(ci->mInputTime.mSampleTime);
+        if (g_in_next && t != g_in_next) S.in_jumps++;
+        g_in_next = t + n;
         long miss = 0;
         for (UInt32 f = 0; f < n; f++) miss += !sring_get(&g_in, t + f, buf + f * NCH);
         if (miss) S.in_miss += miss;
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
         uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
+        if (g_out_next && t != g_out_next) S.out_jumps++;
+        g_out_next = t + n;
         for (UInt32 f = 0; f < n; f++) sring_put(&g_out, t + f, buf + f * NCH);
     }
     return noErr;
