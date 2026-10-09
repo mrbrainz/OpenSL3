@@ -4,7 +4,8 @@
  * every object and scope, and cycles StartIO/StopIO. Plays nothing; needs
  * exclusive access to the SL3 (stop any bridge first).
  * Usage: sl3plugtest [bundle] [cycles]
- *        sl3plugtest bundle hotplug SECONDS   (IO running; unplug/replug the box) */
+ *        sl3plugtest bundle hotplug SECONDS   (IO running; unplug/replug the box)
+ *        sl3plugtest bundle rate HZ SECONDS   (switch rate, then run IO) */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 static int g_notes, g_running_notes;
+static AudioServerPlugInDriverRef g_drv;
 
 static const char *fcc(UInt32 v, char *b) {
     for (int i = 0; i < 4; i++) { char c = (char)(v >> (24 - 8 * i)); b[i] = c >= 32 && c < 127 ? c : '.'; }
@@ -27,10 +29,20 @@ static OSStatus H_PropertiesChanged(AudioServerPlugInHostRef h, AudioObjectID o,
     return 0;
 }
 static OSStatus H_CopyFromStorage(AudioServerPlugInHostRef h, CFStringRef k, CFPropertyListRef *d) { (void)h; (void)k; *d = NULL; return 0; }
-static OSStatus H_WriteToStorage(AudioServerPlugInHostRef h, CFStringRef k, CFPropertyListRef d) { (void)h; (void)k; (void)d; return 0; }
+static OSStatus H_WriteToStorage(AudioServerPlugInHostRef h, CFStringRef k, CFPropertyListRef d) {
+    (void)h; char b[64]; double v = 0;
+    CFStringGetCString(k, b, sizeof b, kCFStringEncodingUTF8);
+    if (CFGetTypeID(d) == CFNumberGetTypeID()) CFNumberGetValue(d, kCFNumberDoubleType, &v);
+    printf("  host: WriteToStorage \"%s\" = %g\n", b, v);
+    return 0;
+}
 static OSStatus H_DeleteFromStorage(AudioServerPlugInHostRef h, CFStringRef k) { (void)h; (void)k; return 0; }
 static OSStatus H_RequestCfg(AudioServerPlugInHostRef h, AudioObjectID o, UInt64 a, void *i) {
-    (void)h; (void)i; printf("  host: RequestDeviceConfigurationChange obj %u action %llu\n", o, a); g_notes++; return 0;
+    (void)h; printf("  host: RequestDeviceConfigurationChange obj %u action %llu\n", o, a); g_notes++;
+    /* Core Audio would stop IO first and call this later, on its own thread */
+    OSStatus e = (*g_drv)->PerformDeviceConfigurationChange(g_drv, o, a, i);
+    printf("  PerformDeviceConfigurationChange %d\n", (int)e);
+    return 0;
 }
 static AudioServerPlugInHostInterface g_host = {
     H_PropertiesChanged, H_CopyFromStorage, H_WriteToStorage, H_DeleteFromStorage, H_RequestCfg
@@ -129,7 +141,20 @@ int main(int argc, char **argv) {
     AudioServerPlugInDriverRef d = factory(NULL, kAudioServerPlugInTypeUUID);
     AudioServerPlugInHostInterface *hp = &g_host;
     if ((*d)->Initialize(d, hp)) { fprintf(stderr, "Initialize failed\n"); return 1; }
+    g_drv = d;
     if (argc > 3 && !strcmp(argv[2], "hotplug")) return hotplug(d, atoi(argv[3]));
+    if (argc > 4 && !strcmp(argv[2], "rate")) {
+        AudioObjectPropertyAddress sr = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        Float64 hz = atof(argv[3]), now = 0; UInt32 out;
+        printf("SetPropertyData rate %.0f: %d\n", hz, (int)(*d)->SetPropertyData(d, 2, getpid(), &sr, 0, NULL, sizeof hz, &hz));
+        (*d)->GetPropertyData(d, 2, getpid(), &sr, 0, NULL, sizeof now, &out, &now);
+        printf("nominal rate now %.0f\n", now);
+        int bad = quiet_walk(d);
+        printf("StartIO %d\n", (int)(*d)->StartIO(d, 2, 1));
+        sleep(atoi(argv[4]));
+        printf("StopIO %d\n== %d property problems\n", (int)(*d)->StopIO(d, 2, 1), bad);
+        return bad != 0;
+    }
     printf("== property walk (idle)\n");
     int bad = walk(d, kAudioObjectPlugInObject, 0);
     AudioObjectPropertyAddress run = { kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };

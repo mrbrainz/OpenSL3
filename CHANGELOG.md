@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- `SL3Device.driver`: 44.1 and 48 kHz, chosen in Audio MIDI Setup or the app and remembered. The driver now sets the box's rate at every start, so a box left at another rate (for example by Rane's driver) no longer runs off speed.
 - `sl3ctl set-rate 44100|48000` sets the box's sample rate (vendor command `0x31`). The rate survives power cycles.
 - README: Core Audio driver install, removal and Mixxx setup.
 - `SL3Device.driver`: hot-plug. Apps using the SL3 keep the device through an unplug (the decks fall back to thru) and resume when it is plugged in again; when nothing uses it, an unplugged SL3 disappears from Core Audio until it is back.

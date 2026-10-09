@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * SL3 Core Audio device: an AudioServerPlugIn that drives the SL3 directly
- * through IOUSBHost and publishes it as one 6-in/6-out device at 44.1 kHz.
+ * through IOUSBHost and publishes it as one 6-in/6-out device at 44.1 or 48 kHz.
  *
  * The device runs on the SL3's own clock: its sample time is the count of
  * captured frames, and GetZeroTimeStamp maps sample time to host time with
@@ -42,7 +42,11 @@
 #define NCH 6
 #define FRAME_BYTES 18
 #define PKT_MAX 126
-#define RATE 44100.0
+/* Sample rate: 44.1 or 48 kHz, set on the box with 0x31 at every start (the
+ * box keeps its rate across power cycles, so it can't be assumed). */
+static double g_rate_hz = 44100;
+#define RATE g_rate_hz
+#define RATE_KEY CFSTR("sample rate")
 #define CAP_PKTS 8      /* microframes per transfer: 1 ms, must be a multiple of 8 */
 #define CAP_NXF 64      /* 64 ms of capture queued */
 #define PLAY_PKTS 8
@@ -53,14 +57,16 @@
 #endif
 #define RING 16384      /* frames, power of two */
 #define ZTS_PERIOD 2048 /* frames between zero timestamps */
-/* Safety offsets (frames): input must lag the hardware by the worst
- * completion delay, output must lead it by the playback queue plus margin. */
+/* Safety offsets (frames at 44.1 kHz, scaled with the rate): input must lag
+ * the hardware by the worst completion delay, output must lead it by the
+ * playback queue plus margin. */
 #ifndef IN_SAFETY
 #define IN_SAFETY  800
 #endif
 #ifndef OUT_SAFETY
 #define OUT_SAFETY (PLAY_NXF * 44 + 80)
 #endif
+#define AT_RATE(f) ((UInt32)llround((f) * RATE / 44100.0))
 /* Converter latency (frames) beyond the USB timeline. sl3loop measured a
  * steady 47-frame round trip (deck 3 out -> deck 2 in, line), split evenly. */
 #ifndef LAT_IN
@@ -468,7 +474,19 @@ static int usb_open_all(void) {
     }
     IOObjectRelease(dsvc);
 
+    /* interface 3 first: set the rate before the streams start */
     NSError *e = nil;
+    if (!((g_hid = usb_open(IF_HID)) && (g_hout = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e]) &&
+          (g_hin = [g_hid copyPipeWithAddress:EP_HID_IN error:&e]) &&
+          (g_req_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_req_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) &&
+          (g_hb_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_hb_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]))) {
+        os_log_error(g_log, "interface 3 unavailable; decks stay in thru, rate not set");
+        [g_hid destroy]; g_hid = nil; g_hout = g_hin = nil;
+    } else {
+        uint8_t rp[2] = {(uint8_t)((int)RATE >> 8), (uint8_t)(int)RATE}, reply[HID_REPORT];
+        if (hid_request(0x31, rp, 2, reply)) os_log_error(g_log, "set rate %.0f failed", RATE);
+        else usleep(20000);
+    }
     g_cap = usb_open(IF_CAP);
     g_play = usb_open(IF_PLAY);
     if (!g_cap || !g_play || ![g_cap selectAlternateSetting:1 error:&e] || ![g_play selectAlternateSetting:1 error:&e] ||
@@ -508,19 +526,13 @@ static int usb_open_all(void) {
     });
 
     /* interface 3: switch the decks to USB audio and keep the heartbeat going */
-    if ((g_hid = usb_open(IF_HID)) && (g_hout = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e]) &&
-        (g_hin = [g_hid copyPipeWithAddress:EP_HID_IN error:&e]) &&
-        (g_req_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_req_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) &&
-        (g_hb_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_hb_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e])) {
+    if (g_hid) {
         if (set_usb_switches(0x01)) os_log_error(g_log, "switch write incomplete");
         dispatch_sync(g_q, ^{ hb_read(); });
         g_hb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
         dispatch_source_set_timer(g_hb_timer, dispatch_time(DISPATCH_TIME_NOW, 0), HEARTBEAT_MS * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(g_hb_timer, ^{ hb_tick(); });
         dispatch_resume(g_hb_timer);
-    } else {
-        os_log_error(g_log, "interface 3 unavailable; decks stay in thru");
-        [g_hid destroy]; g_hid = nil; g_hout = g_hin = nil;
     }
     g_in_next = g_out_next = 0;
     g_stat_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
@@ -620,24 +632,47 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
     g_host = host;
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     g_tick_ns = (double)tb.numer / tb.denom;
+    CFPropertyListRef saved = NULL;
+    if (host->CopyFromStorage(host, RATE_KEY, &saved) == noErr && saved) {
+        double r = 0;
+        if (CFGetTypeID(saved) == CFNumberGetTypeID()) CFNumberGetValue(saved, kCFNumberDoubleType, &r);
+        if (r == 44100 || r == 48000) g_rate_hz = r;
+        CFRelease(saved);
+    }
     hotplug_start();
-    os_log(g_log, "Initialize, SL3 %{public}s", g_present ? "present" : "not present");
+    os_log(g_log, "Initialize, SL3 %{public}s, %.0f Hz", g_present ? "present" : "not present", g_rate_hz);
     return noErr;
 }
 static OSStatus CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *c, AudioObjectID *o) { (void)d; (void)desc; (void)c; (void)o; return kAudioHardwareUnsupportedOperationError; }
 static OSStatus DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID o) { (void)d; (void)o; return kAudioHardwareUnsupportedOperationError; }
 static OSStatus AddClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
 static OSStatus RemoveClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
-static OSStatus PerformCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return noErr; }
+static OSStatus PerformCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) {
+    (void)d; (void)i;
+    if (o != kObjDevice || (a != 44100 && a != 48000)) return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&g_lock);
+    if (a != (UInt64)RATE) {
+        g_rate_hz = (double)a;
+        /* new timeline: the clock model starts again from the next StartIO */
+        atomic_fetch_add(&g_clk.seq, 1); g_clk.valid = 0; atomic_fetch_add(&g_clk.seq, 1);
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &g_rate_hz);
+        g_host->WriteToStorage(g_host, RATE_KEY, n);
+        CFRelease(n);
+        os_log(g_log, "sample rate %.0f Hz", g_rate_hz);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return noErr;
+}
 static OSStatus AbortCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return noErr; }
 
-static AudioStreamBasicDescription stream_format(void) {
+static AudioStreamBasicDescription format_at(double rate) {
     return (AudioStreamBasicDescription){
-        .mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
+        .mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM,
         .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
         .mBytesPerPacket = 4 * NCH, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * NCH,
         .mChannelsPerFrame = NCH, .mBitsPerChannel = 32 };
 }
+static AudioStreamBasicDescription stream_format(void) { return format_at(RATE); }
 
 /* Property table: returns the value size, or 0 if the object has no such property.
  * With data != NULL, also writes the value (data must hold the returned size). */
@@ -677,10 +712,12 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioDevicePropertyDeviceIsRunning: RET(UInt32, g_io_clients > 0);
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: RET(UInt32, 1);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RET(UInt32, 0);
-        case kAudioDevicePropertyLatency: RET(UInt32, sc == kAudioObjectPropertyScopeInput ? LAT_IN : LAT_OUT);
-        case kAudioDevicePropertySafetyOffset: RET(UInt32, sc == kAudioObjectPropertyScopeInput ? IN_SAFETY : OUT_SAFETY);
+        case kAudioDevicePropertyLatency: RET(UInt32, AT_RATE(sc == kAudioObjectPropertyScopeInput ? LAT_IN : LAT_OUT));
+        case kAudioDevicePropertySafetyOffset: RET(UInt32, AT_RATE(sc == kAudioObjectPropertyScopeInput ? IN_SAFETY : OUT_SAFETY));
         case kAudioDevicePropertyNominalSampleRate: RET(Float64, RATE);
-        case kAudioDevicePropertyAvailableNominalSampleRates: RET(AudioValueRange, ((AudioValueRange){RATE, RATE}));
+        case kAudioDevicePropertyAvailableNominalSampleRates:
+            if (data) { ((AudioValueRange *)data)[0] = (AudioValueRange){44100, 44100}; ((AudioValueRange *)data)[1] = (AudioValueRange){48000, 48000}; }
+            return 2 * sizeof(AudioValueRange);
         case kAudioDevicePropertyIsHidden: RET(UInt32, 0);
         case kAudioDevicePropertyZeroTimeStampPeriod: RET(UInt32, ZTS_PERIOD);
         case kAudioDevicePropertyPreferredChannelsForStereo: {
@@ -706,7 +743,11 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioStreamPropertyLatency: RET(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: RET(AudioStreamBasicDescription, stream_format());
         case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats:
-            RET(AudioStreamRangedDescription, ((AudioStreamRangedDescription){stream_format(), {RATE, RATE}}));
+            if (data) {
+                ((AudioStreamRangedDescription *)data)[0] = (AudioStreamRangedDescription){format_at(44100), {44100, 44100}};
+                ((AudioStreamRangedDescription *)data)[1] = (AudioStreamRangedDescription){format_at(48000), {48000, 48000}};
+            }
+            return 2 * sizeof(AudioStreamRangedDescription);
         }
         return 0;
     }
@@ -749,7 +790,9 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t 
 }
 static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, Boolean *s) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    *s = false;
+    *s = (o == kObjDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate) ||
+         ((o == kObjStreamIn || o == kObjStreamOut) &&
+          (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat));
     return noErr;
 }
 static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
@@ -787,8 +830,21 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
 static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz, const void *data) {
     (void)qs; (void)q; (void)sz; (void)data;
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate && sz >= sizeof(Float64) && *(const Float64 *)data == RATE) return noErr;
-    return kAudioHardwareUnsupportedOperationError;
+    double want = 0;
+    if (o == kObjDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate) {
+        if (sz < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
+        want = *(const Float64 *)data;
+    } else if ((o == kObjStreamIn || o == kObjStreamOut) &&
+               (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+        if (sz < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
+        AudioStreamBasicDescription f = *(const AudioStreamBasicDescription *)data, ref = format_at(f.mSampleRate);
+        if (memcmp(&f, &ref, sizeof f)) return kAudioDeviceUnsupportedFormatError;
+        want = f.mSampleRate;
+    } else return kAudioHardwareUnsupportedOperationError;
+    if (want != 44100 && want != 48000) return kAudioDeviceUnsupportedFormatError;
+    if (want == RATE) return noErr;
+    /* the host stops IO and calls PerformDeviceConfigurationChange */
+    return g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)want, NULL);
 }
 
 /* kAudioDevicePropertyDeviceIsRunning is tracked by the HAL, which calls

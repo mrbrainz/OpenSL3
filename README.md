@@ -102,7 +102,7 @@ Remove:
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
 ```
 
-In Mixxx, select **Rane SL3** for every input and output at 44,100 Hz:
+In Mixxx, select **Rane SL3** for every input and output at 44,100 or 48,000 Hz:
 
 | Output | Channels | | Input | Channels |
 |--------|----------|-|-------|----------|
@@ -114,7 +114,7 @@ Don't put another card (headphones, a control CD player) in the same Mixxx setup
 
 The decks switch to USB audio when an app starts using the device and back to analog thru when the last one stops. If the SL3 is unplugged while an app uses it, the device stays in place (the decks fall back to analog thru) and audio resumes when it is plugged back in. When nothing uses it, an unplugged SL3 disappears from Core Audio until it is back; apps such as Mixxx only see it again after a restart.
 
-Limitations: 44,100 Hz only; no volume controls. The driver logs to the unified log: `log stream --predicate 'subsystem == "sl3.device"'`. `build/sl3plugtest` loads the driver outside Core Audio to check it (stop any app using the SL3 first).
+The device runs at 44,100 or 48,000 Hz (Audio MIDI Setup or the app's setting); the choice is remembered and set on the box at every start. Limitations: no volume controls. The driver logs to the unified log: `log stream --predicate 'subsystem == "sl3.device"'`. `build/sl3plugtest` loads the driver outside Core Audio to check it (stop any app using the SL3 first).
 
 ## Failure behaviour
 
@@ -156,7 +156,7 @@ docs/usb-descriptors.txt
 
 Issues and pull requests are welcome. These would help most:
 
-- Testing the Core Audio driver, and 48 kHz support for it.
+- Testing the Core Audio driver.
 - Lower latency.
 - Decoding the remaining control bytes and notifications (see the open questions in [docs/PROTOCOL.md](docs/PROTOCOL.md)).
 - Testing with other SL3 units, firmware versions, Intel Macs and DJ software.
