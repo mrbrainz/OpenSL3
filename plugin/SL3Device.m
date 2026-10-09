@@ -728,11 +728,9 @@ static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
     return kAudioHardwareUnsupportedOperationError;
 }
 
-static void notify_running(void) {
-    AudioObjectPropertyAddress a = {kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-    g_host->PropertiesChanged(g_host, kObjDevice, 1, &a);
-}
-
+/* kAudioDevicePropertyDeviceIsRunning is tracked by the HAL, which calls
+ * StartIO/StopIO: the plug-in must not report it changed from inside them
+ * (doing so left coreaudiod spinning in proxy reconciliation). */
 static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) {
     (void)d; (void)c;
     if (o != kObjDevice) return kAudioHardwareBadObjectError;
@@ -740,7 +738,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c)
     OSStatus r = noErr;
     if (g_io_clients == 0) {
         if (usb_open_all()) r = kAudioHardwareNotRunningError;
-        else { g_io_clients = 1; pthread_mutex_unlock(&g_lock); notify_running(); return noErr; }
+        else g_io_clients = 1;
     } else g_io_clients++;
     pthread_mutex_unlock(&g_lock);
     return r;
@@ -753,7 +751,6 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) 
     if (g_io_clients > 0) g_io_clients--;
     if (last) usb_close(1);
     pthread_mutex_unlock(&g_lock);
-    if (last) notify_running();
     return noErr;
 }
 

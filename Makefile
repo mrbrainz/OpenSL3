@@ -41,7 +41,9 @@ $(PROBE): plugin/SL3Probe.m plugin/Info.plist | $(BUILD)
 	codesign -s - -f $@
 
 DEVICE := $(BUILD)/SL3Device.driver
-device-plugin: $(DEVICE)
+device-plugin: $(DEVICE) $(BUILD)/sl3plugtest
+$(BUILD)/sl3plugtest: tools/sl3plugtest.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -framework CoreFoundation -framework CoreAudio
 $(DEVICE): plugin/SL3Device.m plugin/Device-Info.plist | $(BUILD)
 	mkdir -p $@/Contents/MacOS
 	cp plugin/Device-Info.plist $@/Contents/Info.plist
