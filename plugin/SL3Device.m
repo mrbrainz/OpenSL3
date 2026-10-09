@@ -125,13 +125,15 @@ static double rate_add(double t_ms, double frames) {
     return fabs(r / RATE - 1) < 0.01 ? r : 0;
 }
 
+static int g_reanchor, g_cap_done;   /* both only touched on the USB queue once streaming */
+
 /* One capture transfer done: frames up to sample s_end were stamped at host tick t_end. */
 static void clk_update(double s_end, double t_end) {
     double a_s, a_h, tpf; uint64_t seed; int v;
     clk_read(&a_s, &a_h, &tpf, &seed, &v);
     double r = rate_add(t_end * g_tick_ns / 1e6, s_end);
     if (r > 0) tpf = 1e9 / r / g_tick_ns;
-    if (!v) { clk_write(s_end, t_end, 1e9 / RATE / g_tick_ns, 1); return; }
+    if (!v || g_reanchor) { g_reanchor = 0; clk_write(s_end, t_end, v ? tpf : 1e9 / RATE / g_tick_ns, 1); return; }
     if (r > 0) S.rate = r;
     double pred = a_h + (s_end - a_s) * tpf, err = t_end - pred;
     if (fabs(err) * g_tick_ns / 1e3 > S.max_err_us) S.max_err_us = fabs(err) * g_tick_ns / 1e3;
@@ -210,7 +212,10 @@ static BOOL usb_enqueue(IOUSBHostPipe *pipe, IOUSBHostInterface *intf, NSMutable
             return YES;
         }
         S.xfer_err++;
-        *frame = [intf frameNumberWithTime:NULL] + 2;
+        uint64_t now = [intf frameNumberWithTime:NULL];
+        os_log_error(g_log, "%{public}s enqueue for frame %llu failed (now %llu): %{public}@", pipe == g_cpipe ? "capture" : "playback",
+                     *frame, now, e.localizedDescription);
+        *frame = now + 2;
         if (pipe == g_ppipe) g_play_resync = 1;
     }
     return NO;
@@ -239,8 +244,10 @@ static void cap_submit(int i) {
                     sring_put(&g_in, g_cap_s++, fr);
                 }
             }
+            g_cap_done++;
             if (done[CAP_PKTS - 1].timeStamp) clk_update((double)g_cap_s, (double)done[CAP_PKTS - 1].timeStamp);
         } else if (!usb_fatal(st)) S.xfer_err++;
+        if (st != kIOReturnSuccess && !g_stop) os_log_error(g_log, "capture transfer status 0x%x", st);
         if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
         cap_submit(i);
     });
@@ -279,6 +286,7 @@ static void play_submit(int i) {
         make_realtime();
         if (st == kIOReturnSuccess) { for (int k = 0; k < PLAY_PKTS; k++) if (done[k].status != kIOReturnSuccess) S.play_err++; }
         else if (!usb_fatal(st)) S.xfer_err++;
+        if (st != kIOReturnSuccess && !g_stop) os_log_error(g_log, "playback transfer status 0x%x", st);
         if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
         play_submit(i);
     });
@@ -361,6 +369,28 @@ static void hb_tick(void) {
 }
 
 static void usb_close(int present);
+static int usb_open_all(void);
+static void log_stats(const char *tag);
+static _Atomic int g_restarting;
+
+/* Streams died while IO is running: tear down and start again, retrying until
+ * the box is back or IO stops. The device keeps its timeline; the clock model
+ * resyncs with a new seed. */
+static void usb_restart(void) {
+    pthread_mutex_lock(&g_lock);
+    if (g_io_clients > 0) {
+        log_stats("restarting");
+        int present = usb_present();
+        usb_close(present);
+        while (g_io_clients > 0 && usb_open_all()) {
+            pthread_mutex_unlock(&g_lock);
+            sleep(1);
+            pthread_mutex_lock(&g_lock);
+        }
+    }
+    g_restarting = 0;
+    pthread_mutex_unlock(&g_lock);
+}
 
 static void log_stats(const char *tag) {
     os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
@@ -408,8 +438,12 @@ static int usb_open_all(void) {
     memset(&g_rate, 0, sizeof g_rate);
     sring_clear(&g_in); sring_clear(&g_out);
     g_stop = 0; g_inflight = 0; g_hb_inflight = 0; g_hb_busy = 0;
-    g_fifo_w = g_fifo_r = 0; g_acc = 0; g_cap_s = 0;
-    atomic_fetch_add(&g_clk.seq, 1); g_clk.valid = 0; atomic_fetch_add(&g_clk.seq, 1);
+    g_fifo_w = g_fifo_r = 0; g_acc = 0;
+    /* after a restart, continue the timeline from where the old clock says we are */
+    double a_s0, a_h0, tpf0; uint64_t seed0; int valid0;
+    clk_read(&a_s0, &a_h0, &tpf0, &seed0, &valid0);
+    g_cap_s = valid0 ? (uint64_t)llround(a_s0 + ((double)mach_absolute_time() - a_h0) / tpf0) : 0;
+    g_reanchor = 1; g_cap_done = 0;
 
     /* capture first; once the clock model has an anchor, start playback */
     dispatch_sync(g_q, ^{
@@ -417,9 +451,9 @@ static int usb_open_all(void) {
         for (int i = 0; i < CAP_NXF && !g_stop; i++) { g_inflight++; cap_submit(i); }
     });
     usleep(50000);
-    double a_s, a_h, tpf; uint64_t seed; int valid;
-    clk_read(&a_s, &a_h, &tpf, &seed, &valid);
-    if (!valid || g_stop) { os_log_error(g_log, "capture did not start"); usb_close(1); return -1; }
+    __block int started;
+    dispatch_sync(g_q, ^{ started = g_cap_done > 0 && !g_reanchor; });
+    if (!started || g_stop) { os_log_error(g_log, "capture did not start"); usb_close(1); return -1; }
     dispatch_sync(g_q, ^{
         g_fifo_r = g_fifo_w;
         g_pframe = [g_play frameNumberWithTime:NULL] + 2;
@@ -445,7 +479,11 @@ static int usb_open_all(void) {
     g_in_next = g_out_next = 0;
     g_stat_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
     dispatch_source_set_timer(g_stat_timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(g_stat_timer, ^{ log_stats("stats"); S.max_err_us = 0; });
+    dispatch_source_set_event_handler(g_stat_timer, ^{
+        log_stats("stats");
+        S.max_err_us = 0;
+        if (g_stop && !g_restarting) { g_restarting = 1; dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ usb_restart(); }); }
+    });
     dispatch_resume(g_stat_timer);
     os_log(g_log, "SL3 streaming");
     return 0;
