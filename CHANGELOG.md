@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- README: Core Audio driver install, removal and Mixxx setup.
 - `SL3Device.driver`: hot-plug. The device disappears from Core Audio while the SL3 is unplugged and comes back when it is plugged in again; running streams restart within a second of replugging (previously they never recovered).
 - `SL3Device.driver`: fixed coreaudiod spinning at high CPU (and Core Audio apps hanging) after a few device start/stop cycles.
 - New `sl3plugtest` tool (built by `make device-plugin`): loads the driver outside Core Audio, checks every property and cycles IO start/stop.

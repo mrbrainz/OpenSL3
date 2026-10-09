@@ -85,6 +85,37 @@ Set Mixxx's **audio buffer** (Preferences → Sound Hardware) as low as plays wi
 
 **Preferences → Vinyl Control:** set the vinyl type for each deck (for example *Serato CV02 Vinyl*, or *Serato CD* for the control CD). Turn on vinyl control on each deck, in ABS mode for needle dropping. Deck 3 needs a skin that shows four decks.
 
+## Core Audio driver (experimental)
+
+`SL3Device.driver` is a Core Audio plug-in that makes the SL3 itself a 6-in/6-out audio device called **Rane SL3**, with no bridge, BlackHole or resampling: it runs on the SL3's own clock. Latency is about 18 ms in and 22 ms out plus the app's buffer. Use either the driver or the bridge, not both.
+
+Build and install (quit audio apps first):
+
+```bash
+make device-plugin
+sudo cp -R build/SL3Device.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
+```
+
+Remove:
+
+```bash
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/SL3Device.driver && sudo killall coreaudiod
+```
+
+In Mixxx, select **Rane SL3** for every input and output at 44,100 Hz:
+
+| Output | Channels | | Input | Channels |
+|--------|----------|-|-------|----------|
+| Deck 1 | 1–2 | | Vinyl Control 1 | 1–2 |
+| Deck 2 | 3–4 | | Vinyl Control 2 | 3–4 |
+| Deck 3 | 5–6 | | Vinyl Control 3 | 5–6 |
+
+Don't put another card (headphones, a control CD player) in the same Mixxx setup without drift correction: two clocks cause distortion and pitch jumps.
+
+The decks switch to USB audio when an app starts using the device and back to analog thru when the last one stops. If the SL3 is unplugged, it disappears from Core Audio and running apps lose it; it reappears when plugged back in, and apps need to select it or start audio again.
+
+Limitations: 44,100 Hz only; no volume controls. The driver logs to the unified log: `log stream --predicate 'subsystem == "sl3.device"'`. `build/sl3plugtest` loads the driver outside Core Audio to check it (stop any app using the SL3 first).
+
 ## Failure behaviour
 
 | Event | What you hear |
@@ -103,6 +134,10 @@ Diagnostic tools used to work out the protocol. None of them is needed to play.
 | `sl3probe` | Print the device descriptors and record the SL3's inputs to a WAV file. Never writes to the control channel |
 | `sl3play` | Play a quiet test tone on output channels 1–2 |
 | `sl3ctl` | Read and write the box's control bytes, and send the heartbeat by hand |
+| `sl3rec` | Record from a Core Audio device for a few seconds and report levels, channel correlation and callback timing |
+| `sl3tone` | Play a quiet sine on all outputs of a Core Audio device |
+| `sl3loop` | Measure round-trip latency through a loopback cable |
+| `sl3plugtest` | Load `SL3Device.driver` outside Core Audio, check its properties and cycle IO; `hotplug SECONDS` mode for unplug tests |
 | `sl3usbtiming` | Measure capture completion timing with IOUSBHost or libusb (`sl3usbtiming MODE [seconds] [transfers]`, MODE is `iousbhost` or `libusb`); read-only |
 
 Stop `sl3bridge` before using `sl3ctl`, because only one process can claim the control interface at a time. **The SL3 keeps its control bytes across power cycles**, so only use `sl3ctl set-control` when you know what a byte does.
@@ -111,6 +146,7 @@ Stop `sl3bridge` before using `sl3ctl`, because only one process can claim the c
 
 ```
 src/sl3bridge.c       the bridge
+plugin/               Core Audio driver (SL3Device) and probe plug-in
 tools/                diagnostic tools
 docs/PROTOCOL.md      SL3 USB protocol notes
 docs/usb-descriptors.txt
@@ -120,7 +156,7 @@ docs/usb-descriptors.txt
 
 Issues and pull requests are welcome. These would help most:
 
-- A CoreAudio AudioServerPlugIn, so the SL3 shows up as a real audio device without BlackHole.
+- Testing the Core Audio driver, and 48 kHz support for it.
 - Lower latency.
 - Decoding the remaining control bytes and notifications (see the open questions in [docs/PROTOCOL.md](docs/PROTOCOL.md)).
 - Testing with other SL3 units, firmware versions, Intel Macs and DJ software.
